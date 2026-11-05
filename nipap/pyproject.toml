@@ -40,6 +40,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+jwt = ["PyJWT[crypto]==2.15.0"]
 instrumentation = [
   "opentelemetry-api==1.29.0",
   "opentelemetry-exporter-otlp==1.29.0",

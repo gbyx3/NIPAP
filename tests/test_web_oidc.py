@@ -12,12 +12,12 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 try:
-    from joserfc import jwt
-    from joserfc.jwk import RSAKey, OctKey
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
     from nipapwww.oidc import LoginRejected, Provider, Transactions, local_return_path
     from nipapwww.oidc import init_app
 except ModuleNotFoundError as error:
-    if error.name not in ('authlib', 'joserfc', 'requests'):
+    if error.name not in ('authlib', 'jwt', 'cryptography', 'requests'):
         raise
     raise unittest.SkipTest('Install the nipap-www oidc extra to run OIDC tests')
 from flask import Flask, session
@@ -76,8 +76,8 @@ class TransactionsTest(unittest.TestCase):
 class ProviderTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.key = RSAKey.generate_key(2048)
-        cls.other = RSAKey.generate_key(2048)
+        cls.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        cls.other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
     def setUp(self):
         self.config = dict(issuer='https://idp.test/issuer',
@@ -97,9 +97,10 @@ class ProviderTest(unittest.TestCase):
                            sid='exact-sid', acr='bio-uv')
 
     def validate(self, claims=None, key=None, algorithm='RS256'):
-        encoded = jwt.encode({'alg': algorithm}, self.claims if claims is None else claims,
-                             key or self.key)
-        return self.provider.validate(encoded, 'test-nonce', self.key)
+        encoded = jwt.encode(self.claims if claims is None else claims,
+                             key or self.key, algorithm=algorithm)
+        keys = [json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(self.key.public_key()))]
+        return self.provider.validate(encoded, 'test-nonce', keys)
 
     def test_valid_identity_is_server_mapped_readonly(self):
         self.claims.update(readonly=False, username='admin')
@@ -150,9 +151,9 @@ class ProviderTest(unittest.TestCase):
         with self.assertRaises(LoginRejected):
             self.validate(key=self.other)
         with self.assertRaises(LoginRejected):
-            self.validate(key=OctKey.generate_key(256), algorithm='HS256')
+            self.validate(key=b'synthetic-hmac-secret-at-least-32-bytes', algorithm='HS256')
         with self.assertRaises(LoginRejected):
-            self.provider.validate('not.a.token', 'test-nonce', self.key)
+            self.provider.validate('not.a.token', 'test-nonce', [])
 
     def test_authorization_url_has_pkce_nonce_and_state(self):
         transaction = dict(verifier='a' * 64, nonce='test-nonce')
@@ -177,7 +178,7 @@ class ProviderTest(unittest.TestCase):
     def test_code_exchange_uses_pkce_fixed_endpoints_and_real_signature(self):
         transaction = dict(nonce='test-nonce', verifier='v' * 64)
         calls = []
-        encoded = jwt.encode({'alg': 'RS256'}, self.claims, self.key)
+        encoded = jwt.encode(self.claims, self.key, algorithm='RS256')
 
         def send(client, prepared, **kwargs):
             calls.append(prepared.url)
@@ -196,7 +197,7 @@ class ProviderTest(unittest.TestCase):
                 self.assertTrue(prepared.headers['Authorization'].startswith('Basic '))
                 data = dict(access_token='test-only-access', token_type='Bearer', id_token=encoded)
             elif prepared.url == self.config['jwks_uri']:
-                data = dict(keys=[self.key.as_dict(private=False)])
+                data = dict(keys=[json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(self.key.public_key()))])
             else:
                 self.fail('Unexpected outbound request')
             response._content = json.dumps(data).encode()
@@ -436,6 +437,8 @@ class AppFactoryTest(unittest.TestCase):
         web = tomllib.loads((root / 'nipap-www/pyproject.toml').read_text())
         requests_pin = next(d for d in backend['project']['dependencies'] if d.startswith('requests=='))
         self.assertIn(requests_pin, web['project']['optional-dependencies']['oidc'])
+        self.assertFalse(any(dependency.lower().startswith('joserfc')
+                             for dependency in web['project']['optional-dependencies']['oidc']))
 
     def test_private_file_enables_full_application_and_rejects_public_file(self):
         path = Path(self.directory.name) / 'oidc.json'

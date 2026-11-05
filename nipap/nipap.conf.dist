@@ -180,6 +180,18 @@ db_path = /etc/nipap/local_auth.db     ; path to SQLite database used
 #[auth.backends.jwt]
 #type = JwtAuth
 #jwk_url = [https from token provider]
+#issuer = https://issuer.example.test/
+#audience = https://api.example.test/
+#algorithms = RS256
+# Optional private CA file; TLS verification cannot be disabled:
+#ca_bundle = /etc/nipap/idp-ca.pem
+# Optional certificate-assurance and immutable-identity restrictions.
+# These claim names/values are examples, not standard AD FS claims:
+#required_claims = {"authn": "certificate"}
+#max_age = 300
+#identity_claim = directory_id
+#allowed_identities = ["example-immutable-directory-id"]
+# See docs/jwt-auth.md before enabling or upgrading an existing JWT backend.
 #
 ## Group permissions
 # Group permissions enables granting read-write or read-only privileges based

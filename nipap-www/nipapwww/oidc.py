@@ -12,26 +12,15 @@ from pathlib import Path
 import secrets
 import sqlite3
 import time
-from urllib.parse import urlsplit
 
 from authlib.integrations.requests_client import OAuth2Session
-from joserfc import jwt
-from joserfc.jwk import KeySet
-import requests
 from flask import Blueprint, abort, current_app, g, redirect, request, session, url_for
+from nipap.jwt_auth import JwtVerifier, claim_matches, https_url
 from .web_security import init_app as init_web_security, local_return_path
 
 
 class LoginRejected(ValueError):
     """A login could not be authenticated or authorized. Never include tokens."""
-
-
-def https_url(value):
-    parsed = urlsplit(value)
-    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username
-            or parsed.password or parsed.fragment):
-        raise ValueError('OIDC requires fixed HTTPS URLs without user information')
-    return value
 
 
 class Transactions:
@@ -142,6 +131,11 @@ class Provider:
             value = self.config.get(name, default)
             if type(value) is not int or not 1 <= value <= 3600:
                 raise ValueError('OIDC time limits must be integers from 1 to 3600 seconds')
+        self.verifier = JwtVerifier(
+            issuer=self.config['issuer'], audience=self.config['client_id'],
+            jwks_uri=self.config['jwks_uri'], algorithms=self.algorithms,
+            ca_bundle=self.config.get('ca_bundle', True),
+            max_age=self.config.get('max_age', 300))
 
     def client(self):
         client = OAuth2Session(
@@ -164,54 +158,12 @@ class Provider:
             return url
 
     def public_keys(self):
-        with requests.Session() as client:
-            client.trust_env = False
-            verify = self.config.get('ca_bundle', True)
-            if not verify:
-                raise ValueError('OIDC TLS verification cannot be disabled')
-            with client.get(self.config['jwks_uri'], timeout=self.timeout,
-                            verify=verify, allow_redirects=False, stream=True) as response:
-                if response.status_code != 200:
-                    raise LoginRejected('Unable to obtain provider signing keys')
-                chunks, size = [], 0
-                for chunk in response.iter_content(8192):
-                    size += len(chunk)
-                    if size > 1024 * 1024:
-                        raise LoginRejected('Provider signing key response too large')
-                    chunks.append(chunk)
-                data = json.loads(b''.join(chunks))
-        # Public asymmetric keys only; never accept an HMAC key from a provider.
-        keys = [key for key in data['keys'] if key.get('kty') in ('RSA', 'EC')
-                and key.get('use', 'sig') == 'sig'
-                and 'd' not in key and 'k' not in key]
-        return KeySet.import_key_set({'keys': keys})
+        return self.verifier.public_keys()
 
     def validate(self, encoded, nonce, keys):
         try:
-            if not isinstance(encoded, str) or len(encoded) > 65536:
-                raise LoginRejected('Invalid ID token')
-            token = jwt.decode(encoded, keys, algorithms=self.algorithms)
-            claims = token.claims
+            claims = self.verifier.validate(encoded, keys=keys, nonce=nonce, oidc=True)
             now = int(time.time())
-            jwt.JWTClaimsRegistry(now=now, leeway=30,
-                iss={'essential': True, 'value': self.config['issuer']},
-                aud={'essential': True, 'value': self.config['client_id']},
-                sub={'essential': True}, exp={'essential': True},
-                iat={'essential': True}, nonce={'essential': True, 'value': nonce},
-            ).validate(claims)
-            audience = claims['aud']
-            if (isinstance(audience, list) and len(audience) > 1
-                    and claims.get('azp') != self.config['client_id']):
-                raise LoginRejected('Invalid authorized party')
-            if 'azp' in claims and claims['azp'] != self.config['client_id']:
-                raise LoginRejected('Invalid authorized party')
-            for key in ('iat', 'exp', 'auth_time'):
-                if (type(claims.get(key)) not in (int, float)
-                        or not math.isfinite(claims[key])):
-                    raise LoginRejected('Missing or invalid token time')
-            if (claims['iat'] > now + 30 or claims['auth_time'] > now + 30
-                    or now - claims['auth_time'] > self.config.get('max_age', 300) + 30):
-                raise LoginRejected('Fresh authentication required')
             identity_key = claims.get(self.identity_claim)
             if not isinstance(identity_key, str) or not identity_key:
                 raise LoginRejected('Missing immutable identity claim')
@@ -219,7 +171,7 @@ class Provider:
             if identity is None:
                 raise LoginRejected('Identity not authorized')
             for key, value in identity.get('required_claims', {}).items():
-                if claims.get(key) != value:
+                if not claim_matches(claims, key, value):
                     raise LoginRejected('Required identity assurance missing')
             return dict(username=identity['username'],
                         full_name=identity.get('full_name', identity['username']),

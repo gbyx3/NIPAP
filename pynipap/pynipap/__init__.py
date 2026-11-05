@@ -14,7 +14,8 @@ __url__         = "http://SpriteLink.github.io/NIPAP"
 xmlrpc_uri = None
 
 # If set, the value assigned to the variable below will be used as a bearer
-# token.
+# token for single-identity clients. Multi-user synchronous clients must use
+# AuthOptions.set_bearer_token() and clear() instead of changing this global.
 bearer_token = None
 
 # Caching of objects is enabled per default but can be disabled for certain

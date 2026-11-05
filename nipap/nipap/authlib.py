@@ -162,6 +162,23 @@ class AuthFactory:
         return auth
 
 
+    def get_auth_http(self, authorization, authoritative_source, auth_options=None):
+        """Dispatch Werkzeug's parsed Basic/Bearer credentials without logging them."""
+        if authorization is None:
+            raise AuthError('Missing authentication method')
+        if authorization.type == 'bearer':
+            token = authorization.token
+            if (not isinstance(token, str) or not token
+                    or any(char.isspace() for char in token)):
+                raise AuthError('Invalid bearer credentials')
+            return self.get_auth_bearer_token(token, authoritative_source, auth_options)
+        if (authorization.type == 'basic' and authorization.username is not None
+                and authorization.password is not None):
+            return self.get_auth(authorization.username, authorization.password,
+                                 authoritative_source, auth_options)
+        raise AuthError('Unsupported authentication method')
+
+
     def get_auth(self, username, password, authoritative_source, auth_options=None):
         """ Returns an authentication object.
 
@@ -304,7 +321,6 @@ class JwtAuth(BaseAuth):
     _jwt_rw_group = None
     _jwt_ro_group = None
     _authenticated = None
-    _jwks_client = None
 
     def __init__(self, name, jwt_token, authoritative_source,
                  auth_options=None):
@@ -344,22 +360,34 @@ class JwtAuth(BaseAuth):
             self._logger.error('Unable to load Python jwt module, please verify it is installed')
             raise AuthError('Unable to authenticate')
 
-        # Set up JWK client as class variable
-        if self._jwks_client is None:
-            jwk_url = self._cfg.get(base_auth_backend, 'jwk_url')
-            if jwk_url is None:
-                self._logger.error("Missing jwk_url in config")
-                raise AuthError("Authentication error")
-            JwtAuth._jwks_client = jwt.PyJWKClient(jwk_url)
-
-        # Decode token
+        # Do not populate identity from an unverified token. Configuration and
+        # signing keys are scoped to this backend, never a class-wide JWK client.
         try:
-            payload = jwt.decode(
-                self._jwt_token, options={"verify_signature": False})
-            self.username = payload.get('sub')
-            self.full_name = payload.get('name', payload.get('sub'))
-        except jwt.exceptions.DecodeError:
-            raise AuthError('Failed to decode JWT token')
+            from .jwt_auth import JwtVerifier
+            self._verifier = JwtVerifier(
+                issuer=self._cfg.get(base_auth_backend, 'issuer'),
+                audience=self._cfg.get(base_auth_backend, 'audience'),
+                jwks_uri=self._cfg.get(base_auth_backend, 'jwk_url'),
+                algorithms=[value.strip() for value in self._cfg.get(
+                    base_auth_backend, 'algorithms').split(',')],
+                ca_bundle=self._cfg.get(base_auth_backend, 'ca_bundle', fallback=True),
+                required_claims=json.loads(self._cfg.get(
+                    base_auth_backend, 'required_claims', fallback='{}')),
+                max_age=self._cfg.getint(base_auth_backend, 'max_age', fallback=None))
+            self._identity_claim = self._cfg.get(base_auth_backend, 'identity_claim', fallback='sub')
+            self._allowed_identities = json.loads(self._cfg.get(
+                base_auth_backend, 'allowed_identities', fallback='null'))
+            if self._allowed_identities is not None and (
+                    not isinstance(self._allowed_identities, list) or not self._allowed_identities
+                    or any(not isinstance(value, str) or not value for value in self._allowed_identities)):
+                raise ValueError('Invalid identity allowlist')
+            self._group_claims = [value.strip() for value in self._cfg.get(
+                base_auth_backend, 'group_claim_name').split(',') if value.strip()]
+            if not self._identity_claim or not self._group_claims or not (
+                    self._jwt_ro_group or self._jwt_rw_group):
+                raise ValueError('Missing JWT authorization configuration')
+        except Exception:
+            raise AuthError('Invalid JWT backend configuration') from None
 
 
     @create_span_authenticate
@@ -370,72 +398,40 @@ class JwtAuth(BaseAuth):
             succeeded or not.
         """
 
-        # if authentication has been performed, return last result
-        if self._authenticated is not None:
-            return self._authenticated
-
-        try:
-            # Decode and verify token
-            jwt_headers = jwt.get_unverified_header(self._jwt_token)
-            signing_key = self._jwks_client.get_signing_key_from_jwt(self._jwt_token)
-            payload = jwt.decode(
-                self._jwt_token,
-                key=signing_key.key,
-                algorithms=[jwt_headers['alg']],
-                options={"verify_aud": False})
-
-            # Fetch group names from list of claims given in config
-            group_claim_name = self._cfg.get('auth.backends.' +
-                                             self.auth_backend,
-                                             'group_claim_name')
-            if group_claim_name is None:
-                self._logger.error("Missing group_claim_name in JWT auth configuration")
-                raise AuthError("Authentication error")
-
-            claim_groups = []
-            for claim_name in map(str.strip, group_claim_name.split(",")):
-                if claim_name in payload:
-                    if type(payload[claim_name]) is str:
-                        claim_groups.append(payload[claim_name])
-                    elif type(payload[claim_name]) is list:
-                        claim_groups += payload[claim_name]
-                    else:
-                        self._logger.error("Unknown type of claim %s (%s)", claim_name, payload[claim_name])
-
-            self._logger.debug("Found groups %s in JWT claims", claim_groups)
-
-            # Validate if the user have RO, RW or nothing
-            if self._jwt_ro_group in claim_groups:
-                self.readonly = True
-                self._authenticated = True
-            elif self._jwt_rw_group in claim_groups:
-                self.readonly = False
-                self._authenticated = True
-            else:
-                self._authenticated = False
-                self._logger.debug("Login failed: JWT missing authorized groups")
-
-        # auth failed
-        except jwt.exceptions.DecodeError:
-            self._logger.debug('Authentication failed - could not decode token because of failed validation')
-            raise AuthError('Failed to decode JWT token')
-        except jwt.exceptions.ExpiredSignatureError:
-            self._logger.debug('Authentication failed - token expired')
-            raise AuthError('Token expired')
-        except jwt.exceptions.InvalidSignatureError:
-            self._logger.debug('Authentication failed - token\'s signature does not match the one provided as part of the token')
-            raise AuthError('Invalid token signature')
-        except jwt.exceptions.InvalidAlgorithmError:
-            self._logger.debug('Authentication failed - the specified algorithm is not recognized by PyJWT')
-            raise AuthError("Unknown token signature algorithm")
-
-        # auth succeeded
-        if self._authenticated:
-            self.authenticated_as = payload.get('sub')
-            self._logger.debug('successfully authenticated as %s using JWT authentication' % self.authenticated_as)
+        # Always revalidate expiry/assurance; a reused instance must not keep an
+        # expired token authenticated. Clear any previous identity on failure.
+        self._authenticated = False
+        self.username = self.full_name = self.authenticated_as = self.readonly = None
         self.trusted = False
-
-        return self._authenticated
+        try:
+            payload = self._verifier.validate(self._jwt_token)
+            identity = payload.get(self._identity_claim)
+            if not isinstance(identity, str) or not identity or (
+                    self._allowed_identities is not None and identity not in self._allowed_identities):
+                return False
+            groups = []
+            for claim in self._group_claims:
+                value = payload.get(claim, [])
+                if isinstance(value, str):
+                    groups.append(value)
+                elif isinstance(value, list) and all(isinstance(group, str) for group in value):
+                    groups.extend(value)
+                else:
+                    return False
+            if self._jwt_ro_group and self._jwt_ro_group in groups:
+                self.readonly = True
+            elif self._jwt_rw_group and self._jwt_rw_group in groups:
+                self.readonly = False
+            else:
+                return False
+            self.username = identity
+            name = payload.get('name')
+            self.full_name = name if isinstance(name, str) else identity
+            self.authenticated_as = payload['sub']
+            self._authenticated = True
+            return True
+        except Exception:
+            raise AuthError('JWT authentication rejected') from None
 
 
 class LdapAuth(BaseAuth):

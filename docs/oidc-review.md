@@ -21,10 +21,16 @@ security review or deployment acceptance. See [configuration and operation](oidc
   notices use escaped `login_notice`; review migration from `welcome_message`.
 - Optional dependencies and separate web-security CI allow local-only installations
   without importing OIDC libraries. Review source and distribution packaging.
+- Shared `nipap.jwt_auth` verification hardens the existing API `JwtAuth` backend
+  and replaces the web adapter's direct JWT-library use. Authlib still brings
+  joserfc transitively. API tokens and ID tokens
+  use distinct validation contexts; browser tokens are not forwarded to the API.
 
 The OIDC module reuses `web_security.py`; it does not duplicate CSRF, secure-cookie,
 mutation or read-only browser guards. External identity reload precedes shared
 read-only enforcement. The Requests pin matches the existing backend requirement.
+See [JWT migration and token boundaries](jwt-auth.md) for the required backend pins,
+certificate assurance, request-scoped API credentials and remaining review gates.
 
 ## Review before packaging
 

@@ -252,6 +252,38 @@ class AuthOptions:
         """Discard the current thread's identity when a request finishes."""
         if hasattr(cls.__state, 'options'):
             del cls.__state.options
+        if hasattr(cls.__state, 'bearer_token'):
+            del cls.__state.bearer_token
+
+    @classmethod
+    def set_bearer_token(cls, token):
+        """Set this synchronous request's API access token; None disables it.
+
+        Never assign per-user tokens to the legacy module-global bearer_token.
+        Clear the request in a finally block or application teardown.
+        """
+        if token is not None and (not isinstance(token, str) or not token
+                                  or any(char.isspace() for char in token)):
+            raise NipapMissingInputError('Invalid bearer token')
+        cls.__state.bearer_token = token
+
+    @classmethod
+    def get_bearer_token(cls):
+        if hasattr(cls.__state, 'bearer_token'):
+            return cls.__state.bearer_token
+        # Compatibility for existing single-identity clients only.
+        from . import bearer_token
+        return bearer_token
+
+    @classmethod
+    def has_request_bearer_token(cls):
+        return hasattr(cls.__state, 'bearer_token')
+
+
+def _shared_cache_enabled():
+    # A per-request identity must never read/write the single-identity cache.
+    from . import CACHE as enabled
+    return enabled and not AuthOptions.has_request_bearer_token()
 
 
 class XMLRPCConnection:
@@ -272,7 +304,8 @@ class XMLRPCConnection:
 
         # This is not a pretty solution, but needed to maintain backwards
         # compatibility and avoiding circular imports.
-        from . import xmlrpc_uri, bearer_token, CACHE as cache_enabled
+        from . import xmlrpc_uri, CACHE as cache_enabled
+        bearer_token = AuthOptions.get_bearer_token()
         global CACHE
         CACHE = cache_enabled
 
@@ -280,6 +313,10 @@ class XMLRPCConnection:
             raise NipapError('XML-RPC URI not specified')
 
         p = urllib.parse.urlsplit(xmlrpc_uri)
+        if bearer_token and p.scheme != 'https':
+            raise NipapMissingInputError('Bearer authentication requires HTTPS')
+        if bearer_token and (p.username is not None or p.password is not None):
+            raise NipapMissingInputError('Bearer authentication requires a URI without Basic credentials')
 
         try:
             from .tracing import TracingXMLTransport, TracingXMLSafeTransport
@@ -521,7 +558,7 @@ class VRF(Pynipap):
         """
 
         # cached?
-        if CACHE:
+        if _shared_cache_enabled():
             if id in _cache['VRF']:
                 log.debug('cache hit for VRF %d' % id)
                 return _cache['VRF'][id]
@@ -532,7 +569,8 @@ class VRF(Pynipap):
         except IndexError:
             raise NipapNonExistentError('no VRF with ID ' + str(id) + ' found')
 
-        _cache['VRF'][id] = vrf
+        if _shared_cache_enabled():
+            _cache['VRF'][id] = vrf
         return vrf
 
 
@@ -662,7 +700,8 @@ class VRF(Pynipap):
         # Refresh object data with attributes from add/edit operation
         VRF.from_dict(vrf, self)
 
-        _cache['VRF'][self.id] = self
+        if _shared_cache_enabled():
+            _cache['VRF'][self.id] = self
 
     @create_span
     def remove(self):
@@ -775,7 +814,8 @@ class Pool(Pynipap):
         # Refresh object data with attributes from add/edit operation
         Pool.from_dict(pool, self)
 
-        _cache['Pool'][self.id] = self
+        if _shared_cache_enabled():
+            _cache['Pool'][self.id] = self
 
     @create_span
     def remove(self):
@@ -807,7 +847,7 @@ class Pool(Pynipap):
         """
 
         # cached?
-        if CACHE:
+        if _shared_cache_enabled():
             if id in _cache['Pool']:
                 log.debug('cache hit for pool %d' % id)
                 return _cache['Pool'][id]
@@ -818,7 +858,8 @@ class Pool(Pynipap):
         except (IndexError, KeyError):
             raise NipapNonExistentError('no pool with ID ' + str(id) + ' found')
 
-        _cache['Pool'][id] = pool
+        if _shared_cache_enabled():
+            _cache['Pool'][id] = pool
         return pool
 
 
@@ -1018,7 +1059,7 @@ class Prefix(Pynipap):
         """
 
         # cached?
-        if CACHE:
+        if _shared_cache_enabled():
             if id in _cache['Prefix']:
                 log.debug('cache hit for prefix %d' % id)
                 return _cache['Prefix'][id]
@@ -1029,7 +1070,8 @@ class Prefix(Pynipap):
         except IndexError:
             raise NipapNonExistentError('no prefix with ID ' + str(id) + ' found')
 
-        _cache['Prefix'][id] = prefix
+        if _shared_cache_enabled():
+            _cache['Prefix'][id] = prefix
         return prefix
 
 
@@ -1283,7 +1325,8 @@ class Prefix(Pynipap):
         Prefix.from_dict(prefix, self)
 
         # update cache
-        _cache['Prefix'][self.id] = self
+        if _shared_cache_enabled():
+            _cache['Prefix'][self.id] = self
         if self.pool is not None:
             if self.pool.id in _cache['Pool']:
                 del _cache['Pool'][self.pool.id]

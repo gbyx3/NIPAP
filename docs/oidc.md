@@ -3,7 +3,8 @@
 Development feature: offline unit coverage is not deployment acceptance. Test
 with the selected identity providers, browser UI and backend before deployment.
 Existing local authentication remains available and OIDC is disabled by default.
-This does not enable or depend on the backend JWT authentication plugin.
+This reuses [the existing JWT verification layer](jwt-auth.md) without enabling
+API bearer authentication or forwarding browser tokens to that API backend.
 It reuses the independent [browser protections](web-security.md), enabling them
 automatically when OIDC is configured, regardless of `web_security_enabled`.
 
@@ -14,9 +15,9 @@ authentication options between synchronous worker threads. This client is not
 intended for interleaved asyncio tasks. All web workers must use the same Flask
 signing key and a private local transaction database directory. Multi-host web
 deployments are not supported by this SQLite transaction store.
-The optional extra reuses the backend's existing Requests version pin. Authlib
-and joserfc remain separate direct dependencies; consolidating token libraries
-is not part of this review split.
+The optional extra reuses the backend's existing Requests version pin and PyJWT
+validator. Authlib supplies the browser protocol client. NIPAP no longer imports
+or directly pins joserfc, although Authlib still installs it transitively.
 
 Add `oidc_config_file = /etc/nipap/oidc.json` to `[www]` in the existing config.
 The JSON file must be a regular file with no group/other permissions, readable
