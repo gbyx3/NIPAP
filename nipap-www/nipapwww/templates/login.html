@@ -3,6 +3,7 @@
 {% block head %}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/login.css') }}?v=dropdown-1">
 {% endblock %}
 
 {% block content %}
@@ -52,12 +53,17 @@
 				<dl>
 					<dt>Or log in with</dt>
 					<dd class="login-auth-methods">
+						<details class="login-method-picker">
+							<summary class="button">Choose sign-in method <span aria-hidden="true">▾</span></summary>
+							<div class="login-method-menu">
 						{% for provider, label in oidc_providers.items() %}
-						<form class="login-auth-method" style="display: inline-block;" action="{{ url_for('oidc.begin', provider_name=provider) }}" method="post">
+						<form class="login-auth-method" action="{{ url_for('oidc.begin', provider_name=provider) }}" method="post">
 							<input type="hidden" name="_csrf" value="{{ oidc_csrf_token() }}">
 							<button type="submit" class="button">{{ label }}</button>
 						</form>
 						{% endfor %}
+							</div>
+						</details>
 					</dd>
 				</dl>
 			</div>

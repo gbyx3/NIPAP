@@ -305,7 +305,7 @@ class BrowserTest(unittest.TestCase):
 
     def test_local_login_is_always_visible_and_precedes_alternatives(self):
         response = self.client.get('/auth/login', base_url=self.base)
-        self.assertNotIn(b'<details', response.data)
+        self.assertLess(response.data.index(b'</form>'), response.data.index(b'<details'))
         self.assertLess(response.data.index(b'class="auth-local-form"'),
                         response.data.index(b'class="login-auth-methods"'))
         self.assertIn(b'name="username"', response.data)
@@ -318,7 +318,7 @@ class BrowserTest(unittest.TestCase):
             response = self.client.post('/auth/login', base_url=self.base, data={
                 'username': 'invalid', 'password': 'test-only', '_csrf': self.csrf()})
         self.assertEqual(response.status_code, 200)
-        self.assertNotIn(b'<details', response.data)
+        self.assertLess(response.data.index(b'</form>'), response.data.index(b'<details'))
         self.assertIn(b'class="auth-local-form"', response.data)
         self.assertIn(b'Invalid username or password', response.data)
 

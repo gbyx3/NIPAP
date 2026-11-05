@@ -1,0 +1,19 @@
+/* Native disclosure keeps provider forms usable without additional JavaScript. */
+.login-method-picker { position: relative; display: inline-block; }
+.login-method-picker summary { list-style: none; cursor: pointer; }
+.login-method-picker summary::-webkit-details-marker { display: none; }
+.login-method-menu {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 10;
+    min-width: 100%;
+    padding: 6px;
+    border: 1px solid #aaa;
+    background: #fff;
+    box-shadow: 0 3px 8px rgb(0 0 0 / 15%);
+}
+.login-method-menu form { margin: 0; }
+.login-method-menu .button { width: 100%; margin: 2px 0; text-align: left; }
+[data-theme="dark"] .login-method-menu { background: #202835; border-color: #48556a; }
+.login-method-picker summary:focus-visible { outline: 2px solid #777; outline-offset: 2px; }
