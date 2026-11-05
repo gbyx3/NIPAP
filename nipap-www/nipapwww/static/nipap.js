@@ -9,6 +9,16 @@
  */
 var PREFIX_BATCH_SIZE = 50;
 
+// Match Angular's same-origin XSRF convention for the legacy jQuery views.
+$(document).ajaxSend(function (event, xhr, settings) {
+	if (!settings.crossDomain && !/^(GET|HEAD|OPTIONS)$/i.test(settings.type)) {
+		var match = document.cookie.match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/);
+		if (match) {
+			xhr.setRequestHeader('X-XSRF-TOKEN', decodeURIComponent(match[1]));
+		}
+	}
+});
+
 /**
  * Global variables...
  */
@@ -804,7 +814,7 @@ function showPrefixMenu(prefix_id) {
                 prefix_list[prefix_id].display_prefix + '?';
 
             confirmation_action = function() {
-				$.getJSON('/xhr/remove_prefix/' + prefix_id, prefixRemoved);
+				$.ajax({url: '/xhr/remove_prefix/' + prefix_id, type: 'POST', dataType: 'json', success: prefixRemoved});
 
 				hidePopupMenu();
 				$(this).dialog('close');
@@ -825,7 +835,7 @@ function showPrefixMenu(prefix_id) {
                 if ($('#confirm_prefix_remove').val().toLowerCase() == auth_src.toLowerCase()) {
 
                     // User entered correct auth scr, remove prefix
-				    $.getJSON('/xhr/remove_prefix/' + prefix_id, prefixRemoved);
+				    $.ajax({url: '/xhr/remove_prefix/' + prefix_id, type: 'POST', dataType: 'json', success: prefixRemoved});
 
 				    hidePopupMenu();
 				    $(this).dialog('close');

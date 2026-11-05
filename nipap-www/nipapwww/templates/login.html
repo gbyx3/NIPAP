@@ -1,70 +1,88 @@
 {% extends "base.html" %}
 
+{% block head %}
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+{% endblock %}
+
 {% block content %}
 
-<form action="/auth/login" method="post">
 <div style="padding-top: 30px;">
 	<div class="options-group">
 		<div class="options-content">
-			<div class="options-group-heading">
-				Log in
-			</div>
+			<div class="options-group-heading" id="login-heading">Log in</div>
 			<div class="rule"></div>
-			{% if g.welcome_message is defined %}
+			{% if g.login_notice %}
 			<div class="option">
 				<dl>
 					<dt></dt>
-					<dd>{{g.welcome_message}}</dd>
+					<dd>{{ g.login_notice }}</dd>
 				</dl>
 			</div>
 			<div class="rule"></div>
 			{% endif %}
-			<div class="option">
-				<dl>
-					<dt>Username</dt>
-					<dd><input type="text" name="username"></dd>
-				</dl>
-			</div>
+			<form class="auth-local-form" action="{{ url_for('auth.login') }}" method="post">
+				{% if oidc_providers|default({}) %}
+				<input type="hidden" name="_csrf" value="{{ oidc_csrf_token() }}">
+				{% endif %}
+				<div class="option">
+					<dl>
+						<dt><label for="login-username">Username</label></dt>
+						<dd><input id="login-username" type="text" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required></dd>
+					</dl>
+				</div>
+				<div class="rule"></div>
+				<div class="option">
+					<dl>
+						<dt><label for="login-password">Password</label></dt>
+						<dd><input id="login-password" type="password" name="password" autocomplete="current-password" required></dd>
+					</dl>
+				</div>
+				<div class="rule"></div>
+				<div class="option">
+					<dl>
+						<dt></dt>
+						<dd><input type="submit" value="Log in" class="button button_red"></dd>
+					</dl>
+				</div>
+			</form>
+			{% if oidc_providers|default({}) %}
 			<div class="rule"></div>
 			<div class="option">
 				<dl>
-					<dt>Password</dt>
-					<dd><input type="password" name="password"></dd>
+					<dt>Or log in with</dt>
+					<dd class="login-auth-methods">
+						{% for provider, label in oidc_providers.items() %}
+						<form class="login-auth-method" style="display: inline-block;" action="{{ url_for('oidc.begin', provider_name=provider) }}" method="post">
+							<input type="hidden" name="_csrf" value="{{ oidc_csrf_token() }}">
+							<button type="submit" class="button">{{ label }}</button>
+						</form>
+						{% endfor %}
+					</dd>
 				</dl>
 			</div>
-			<div class="rule"></div>
-			<div class="option">
-				<dl>
-					<dt></dt>
-					<dd><input type="submit" value="Log in" class="button button_red" /></dd>
-				</dl>
-			</div>
+			{% endif %}
 		</div>
 	</div>
 </div>
-</form>
 
 {% if g.error %}
-<div id="login_failure_container">
+<div id="login_failure_container" role="alert">
 	<div class="options-group">
 		<div class="options-content">
 			<h3 class="options-group-heading">Result</h3>
-			<div class="login-result login-result-error">
-				{{ g.error }}
-			</div>
+			<div class="login-result login-result-error">{{ g.error }}</div>
 		</div>
 	</div>
 </div>
 {% endif %}
 
 {% if g.logged_out %}
-<div id="logout_successful_container">
+<div id="logout_successful_container" role="status">
 	<div class="options-group">
 		<div class="options-content">
 			<h3 class="options-group-heading">Result</h3>
-			<div class="login-result login-result-success">
-				Logged out
-			</div>
+			<div class="login-result login-result-success">Logged out</div>
 		</div>
 	</div>
 </div>

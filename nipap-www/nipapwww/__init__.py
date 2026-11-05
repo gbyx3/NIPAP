@@ -29,6 +29,21 @@ def create_app(test_config=None):
     for cfg_key, cfg_value in dict(nipap_config.items("www")).items():
         app.config[cfg_key.upper()] = cfg_value
 
+    if test_config is not None:
+        app.config.update(test_config)
+
+    # Optional and disabled by default. Keep secrets out of the main config and
+    # do not import OIDC dependencies for existing local-only installations.
+    if app.config.get('OIDC_CONFIG_FILE'):
+        import json
+        import stat
+        from .oidc import init_app as init_oidc
+        with open(app.config['OIDC_CONFIG_FILE']) as config_file:
+            mode = os.fstat(config_file.fileno()).st_mode
+            if not stat.S_ISREG(mode) or mode & 0o077:
+                raise NipapConfigError('OIDC configuration must be a private regular file')
+            init_oidc(app, json.load(config_file))
+
     # ensure the instance folder exists
     try:
         os.makedirs(app.instance_path)

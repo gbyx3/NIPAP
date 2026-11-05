@@ -1,4 +1,5 @@
 import functools
+from urllib.parse import urlsplit
 
 from flask import (
     Blueprint, current_app, g, redirect, render_template, request, session,
@@ -11,6 +12,11 @@ from pynipap import AuthOptions
 
 
 bp = Blueprint('auth', __name__, url_prefix='/auth')
+
+
+@bp.teardown_app_request
+def clear_auth(error=None):
+    AuthOptions.clear()
 
 
 def login_required(view):
@@ -32,6 +38,8 @@ def setup_auth():
 
     if current_app.config.get("WELCOME_MESSAGE"):
         g.welcome_message = current_app.config.get("WELCOME_MESSAGE")
+    if current_app.config.get("LOGIN_NOTICE"):
+        g.login_notice = current_app.config["LOGIN_NOTICE"]
 
     # set authentication options
     o = AuthOptions({
@@ -75,7 +83,11 @@ def login():
     session.permanent = True
 
     # Send user back to the page he originally wanted to get to
-    if path_before_login:
+    if (path_before_login and path_before_login.startswith('/')
+            and not path_before_login.startswith('//')
+            and '\\' not in path_before_login
+            and not any(ord(c) < 33 or ord(c) == 127 for c in path_before_login)
+            and not urlsplit(path_before_login).netloc):
         return redirect(path_before_login)
 
     else:
@@ -83,7 +95,7 @@ def login():
         return redirect(url_for('prefix.list'))
 
 
-@bp.route('/logout', methods=('GET',))
+@bp.route('/logout', methods=('GET', 'POST'))
 def logout():
     """ Log out the user and display a confirmation message.
     """

@@ -109,9 +109,18 @@
 						<span class="theme-switch-thumb" aria-hidden="true"></span>
 					</button>
 					</li>
+					{% if session.user is defined %}
 					<li style="display: inline-block; padding: 0; margin: 0;">
+					{% if g.oidc_enabled %}
+					<form action="{{ url_for('auth.logout') }}" method="post" style="display: inline;">
+						<input type="hidden" name="_csrf" value="{{ oidc_csrf_token() }}">
+						<button type="submit" class="menu_link">Log out</button>
+					</form>
+					{% else %}
 					<a href="{{ url_for('auth.logout') }}" class="menu_link">Log out</a>
+					{% endif %}
 					</li>
+					{% endif %}
 				</ol>
 			</div>
 		</div>
