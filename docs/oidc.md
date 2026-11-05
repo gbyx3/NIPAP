@@ -1,38 +1,27 @@
 # Optional browser OIDC login
 
-Development feature: offline unit coverage is not deployment acceptance. Test
-with the selected identity providers, browser UI and backend before deployment.
-Existing local authentication remains available and OIDC is disabled by default.
-This reuses [the existing JWT verification layer](jwt-auth.md) without enabling
-API bearer authentication or forwarding browser tokens to that API backend.
-It reuses the independent [browser protections](web-security.md), enabling them
-automatically when OIDC is configured, regardless of `web_security_enabled`.
+OIDC is disabled by default. Local login and the existing login layout remain.
+The adapter uses NIPAP's existing PyJWT dependency and its built-in key selection
+and cache. It does not change the API `JwtAuth` configuration or authorization.
+Authlib handles the browser authorization-code exchange; it brings joserfc
+transitively, although NIPAP does not import or pin joserfc directly.
 
-## Installation and configuration
+## Configuration
 
-Install `nipap-www[oidc]` with the matching updated `pynipap`. The latter isolates
-authentication options between synchronous worker threads. This client is not
-intended for interleaved asyncio tasks. All web workers must use the same Flask
-signing key and a private local transaction database directory. Multi-host web
-deployments are not supported by this SQLite transaction store.
-The optional extra reuses the backend's existing Requests version pin and PyJWT
-validator. Authlib supplies the browser protocol client. NIPAP no longer imports
-or directly pins joserfc, although Authlib still installs it transitively.
+Install `nipap-www[oidc]` with the matching updated `pynipap`. Add
+`oidc_config_file = /etc/nipap/oidc.json` to `[www]`. The file must be private
+(no group/other permissions). Its state directory must be service-owned, mode
+0700, on local storage shared by all web workers. Multi-host deployments and
+interleaved asyncio requests are not supported.
 
-Add `oidc_config_file = /etc/nipap/oidc.json` to `[www]` in the existing config.
-The JSON file must be a regular file with no group/other permissions, readable
-by the web service. Create the state directory owned by that service, mode 0700.
-The database and its short-lived PKCE secrets are private runtime state, not
-publication or troubleshooting artifacts.
-
-Example (reserved domains, synthetic identities, no real credentials):
+Example using invented identities and no real credentials:
 
 ```json
 {
   "transaction_db": "/var/lib/nipap/oidc/state.db",
   "providers": {
     "primary": {
-      "label": "Primary identity provider",
+      "label": "Organization sign-in",
       "issuer": "https://idp.example.test/",
       "authorization_endpoint": "https://idp.example.test/authorize",
       "token_endpoint": "https://idp.example.test/token",
@@ -44,13 +33,11 @@ Example (reserved domains, synthetic identities, no real credentials):
       "max_age": 300,
       "session_ttl": 900,
       "identities": {
-        "provider-issued-immutable-subject": {
+        "immutable-subject": {
           "username": "reader",
           "full_name": "Example Reader",
           "readonly": true,
-          "required_claims": {
-            "acr": "provider-specific-reviewed-assurance"
-          }
+          "required_claims": {"authn": "certificate"}
         }
       }
     }
@@ -58,82 +45,49 @@ Example (reserved domains, synthetic identities, no real credentials):
 }
 ```
 
-Add further named providers using separate clients, callback URIs, signing keys,
-issuers and subject mappings. Do not copy assurance strings between providers:
-configure the provider to enforce the required authentication ceremony and review
-its actual claims. Map only approved immutable subjects; usernames, email,
-display names and token-supplied roles do not authorize users. Additional required
-claims are exact JSON-value matches. Use a distinct username for each mapped
-identity where audit attribution must distinguish them.
+The example assurance claim is not a standard AD FS claim. Configure the IdP to
+require the intended certificate ceremony and verify the claims it actually
+issues. Group membership or a generic MFA indication is not sufficient evidence.
 
-Providers with pairwise subjects may instead set `identity_claim` to an explicitly
-reviewed, issuer-signed immutable directory identifier. The `identities` keys then
-match that claim; the standard `sub` remains required and is retained for audit.
-Never select an email address or mutable login name as the identity claim.
-Optional `scopes` is a list containing `openid` and any provider-required resource
-scopes; scope values cannot be supplied by browser requests.
+Each provider has its own client, callback, issuer and identity map. Identity
+keys are exact immutable subjects, never email addresses or display names.
+`identity_claim` may name another reviewed immutable signed claim; `sub` remains
+required for audit. The server owns username and read-only permissions.
 
-The client requests `openid`, PKCE S256, nonce, and fresh authentication using
-`max_age`. ID tokens must contain numeric `iat`, `exp` and `auth_time`; providers
-that omit `auth_time` are rejected, not silently downgraded. Issuer and endpoint
-URLs are explicit administrator-reviewed HTTPS settings; dynamic discovery and
-HTTP redirects are not followed. Use optional `ca_bundle` for a trusted private
-CA bundle; disabling certificate verification is prohibited. Environment proxy
-and netrc credentials are deliberately ignored for OIDC outbound requests.
+Optional `scopes` must include `openid`; use it for provider-required resource
+scopes. `ca_bundle` may specify a private CA file. Endpoints use verified HTTPS,
+no redirects, finite timeouts and no environment proxy/netrc credentials.
+Signing keys use PyJWT's five-minute cache. Token-supplied key URLs are ignored.
+Allowed algorithms are RS256, PS256 and ES256.
 
-Only RS256, PS256 and ES256 may be configured. Confidential clients use
-`client_secret_basic`. Keys are fetched from that provider's fixed JWKS URL.
-No access, refresh or ID token or PKCE verifier is put in the browser session.
-The signed Flask cookie carries mapped identity and absolute session expiry;
-protect and rotate its signing key using the existing operational procedure.
-Identity allowlist removal and read-only changes take effect on the next request
-after configuration reload. There is no provider back-channel logout or central
-session-revocation service; local logout clears the current browser cookie.
+## Security and compatibility
 
-## Authorization and browser compatibility
+The flow uses state, nonce, PKCE S256 and `client_secret_basic`. ID tokens must
+match the configured issuer, audience and algorithms, and contain numeric `iat`,
+`exp` and a recent `auth_time`. Missing freshness or required assurance fails
+closed. Login transactions are consumed once and expire after five minutes.
 
-The sign-in page retains the existing application shell, styles and color theme.
-The native username/password form is always visible, with alternative provider
-choices below it as independent CSRF-protected forms. Layout alternatives are
-reviewed separately from this authentication integration.
-Optional `[www] login_notice` supplies escaped sign-in notices (including any
-required access/legal notice). The existing `welcome_message` remains an
-application message and is not displayed on the OIDC-enabled sign-in page. Local-only
-legacy sign-in retains it when no dedicated notice is configured. Review that
-setting when upgrading if it previously carried a mandatory sign-in notice.
+OIDC always enables the [browser protections](web-security.md): unsafe requests
+need CSRF tokens; mutation GETs and GET logout are rejected. Custom callers need
+POST and `X-XSRF-TOKEN`, or `_csrf` in HTML forms. The native form remains visible,
+and `welcome_message` keeps its existing behavior.
 
-The existing trusted web-to-backend account remains server-side. Do not expose
-its credentials or XML-RPC service to browsers. Read-only enforcement remains
-required in the backend; web mutation rejection is an additional safeguard.
-Audit access uses the explicit existing `audit_admins` allowlist and the identity
-format `<immutable-subject>@oidc:<provider-name>`, not the friendly username.
-Do not grant Audit access merely because a token says `readonly=false`.
+No ID token, access token or PKCE verifier enters the Flask cookie. The existing
+trusted web-to-backend account remains server-side; ID tokens are not forwarded
+as API credentials. Backend authorization is still required. Audit access uses
+the existing `audit_admins` allowlist and `<subject>@oidc:<provider>` identity.
 
-When OIDC is enabled, unsafe requests require a CSRF token. Native login and OIDC
-buttons include it; Angular and the legacy jQuery UI echo the same-origin
-`XSRF-TOKEN` cookie in `X-XSRF-TOKEN`. Mutating legacy GET endpoints are rejected.
-Consumers must use POST and include that header; HTML form consumers can send
-`_csrf`. Return paths must be local. Callback responses use no-store and
-no-referrer. Disable/redact callback query strings in frontend, reverse-proxy,
-APM and web-server access logs: authorization codes must not enter logs.
+All workers need the same Flask signing key. Identity removal and read-only
+changes take effect on requests after configuration reload. Sessions have an
+absolute expiry; local logout clears the cookie. Back-channel logout and central
+session revocation are not implemented.
 
-## Acceptance before deployment
+Do not log callback query strings: authorization codes can appear there. Keep
+provider secrets, transaction databases and real deployment details out of Git.
 
-- Test each provider using its real assurance ceremony, without adding production
-  names, addresses, claims or credentials to this repository.
-- Verify local fallback independently, including login/logout and Audit access.
-- Exercise both Angular and legacy UI reads and authorized writes in disposable
-  test data; verify backend read-only denial independently.
-- Test parallel read-only/administrator sessions, expired sessions, revoked
-  identity mappings, wrong provider/subject/audience, callback replay and CSRF.
-- Verify trusted TLS and bounded outbound network permissions, restart behavior,
-  private runtime-file permissions and logs free of codes/tokens.
-- Retain independent recovery and a scoped rollback; do not infer recovery from
-  unit-test success.
+## Checks before deployment
 
-Local tests:
-
-```sh
-PYTHONPATH=nipap-www:nipap:pynipap python -B -m unittest discover -s tests -p 'test_web_*.py'
-python -B -m unittest discover -s tests -p test_auth_options_isolation.py
-```
+Test real certificate sign-in, native fallback, audit access, allowed and denied
+writes, concurrent users, expiry, revoked mappings, callback replay and CSRF.
+Verify TLS, private file permissions, log redaction and independent recovery.
+Offline tests and package-install checks do not replace that acceptance.

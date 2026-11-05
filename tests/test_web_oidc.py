@@ -99,14 +99,21 @@ class ProviderTest(unittest.TestCase):
     def validate(self, claims=None, key=None, algorithm='RS256'):
         encoded = jwt.encode(self.claims if claims is None else claims,
                              key or self.key, algorithm=algorithm)
-        keys = [json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(self.key.public_key()))]
-        return self.provider.validate(encoded, 'test-nonce', keys)
+        key = jwt.PyJWK.from_dict(json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(self.key.public_key())))
+        with patch.object(self.provider.keys, 'get_signing_key_from_jwt', return_value=key):
+            return self.provider.validate(encoded, 'test-nonce')
 
     def test_valid_identity_is_server_mapped_readonly(self):
         self.claims.update(readonly=False, username='admin')
         identity = self.validate()
         self.assertTrue(identity['readonly'])
         self.assertEqual(identity['username'], 'reader')
+
+    def test_required_assurance_does_not_treat_one_as_true(self):
+        self.config['identities']['immutable-subject']['required_claims']['assurance'] = {'certificate': True}
+        with self.assertRaises(LoginRejected):
+            self.validate(dict(self.claims, assurance={'certificate': 1}))
+        self.validate(dict(self.claims, assurance={'certificate': True}))
 
     def test_explicit_immutable_directory_claim_and_resource_scopes(self):
         self.provider = Provider(dict(self.config, identity_claim='directory_id',
@@ -153,7 +160,7 @@ class ProviderTest(unittest.TestCase):
         with self.assertRaises(LoginRejected):
             self.validate(key=b'synthetic-hmac-secret-at-least-32-bytes', algorithm='HS256')
         with self.assertRaises(LoginRejected):
-            self.provider.validate('not.a.token', 'test-nonce', [])
+            self.provider.validate('not.a.token', 'test-nonce')
 
     def test_authorization_url_has_pkce_nonce_and_state(self):
         transaction = dict(verifier='a' * 64, nonce='test-nonce')
@@ -178,17 +185,17 @@ class ProviderTest(unittest.TestCase):
     def test_code_exchange_uses_pkce_fixed_endpoints_and_real_signature(self):
         transaction = dict(nonce='test-nonce', verifier='v' * 64)
         calls = []
-        encoded = jwt.encode(self.claims, self.key, algorithm='RS256')
+        encoded = jwt.encode(self.claims, self.key, algorithm='RS256', headers={'kid': 'test-key'})
 
         def send(client, prepared, **kwargs):
             calls.append(prepared.url)
             self.assertFalse(kwargs['allow_redirects'])
             self.assertTrue(kwargs['verify'])
-            self.assertEqual(kwargs['timeout'], (5, 15))
             response = requests.Response()
             response.status_code = 200
             response._content_consumed = True
             if prepared.url == self.config['token_endpoint']:
+                self.assertEqual(kwargs['timeout'], (5, 15))
                 self.assertEqual(prepared.method, 'POST')
                 form = parse_qs(prepared.body)
                 self.assertEqual(form['code_verifier'], [transaction['verifier']])
@@ -197,7 +204,10 @@ class ProviderTest(unittest.TestCase):
                 self.assertTrue(prepared.headers['Authorization'].startswith('Basic '))
                 data = dict(access_token='test-only-access', token_type='Bearer', id_token=encoded)
             elif prepared.url == self.config['jwks_uri']:
-                data = dict(keys=[json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(self.key.public_key()))])
+                self.assertEqual(kwargs['timeout'], 15)
+                key = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(self.key.public_key()))
+                key['kid'] = 'test-key'
+                data = dict(keys=[key])
             else:
                 self.fail('Unexpected outbound request')
             response._content = json.dumps(data).encode()
@@ -213,6 +223,37 @@ class ProviderTest(unittest.TestCase):
             with self.assertRaises(LoginRejected) as result:
                 self.provider.exchange('test-code', dict(nonce='n', verifier='v' * 64))
         self.assertNotIn('sensitive-value', str(result.exception))
+
+    def test_signing_keys_use_pyjwt_cache_and_fixed_https_fetch(self):
+        key = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(self.key.public_key()))
+        key['kid'] = 'test-key'
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps({'keys': [key]}).encode()
+        response._content_consumed = True
+        encoded = jwt.encode(self.claims, self.key, algorithm='RS256', headers={
+            'kid': 'test-key', 'jku': 'https://untrusted.example.test/keys'})
+        with patch.object(requests.Session, 'get', return_value=response) as fetch:
+            self.provider.validate(encoded, 'test-nonce')
+            self.provider.validate(encoded, 'test-nonce')
+        fetch.assert_called_once_with(self.config['jwks_uri'], timeout=15,
+                                      verify=True, allow_redirects=False, stream=True)
+
+    def test_signing_key_fetch_rejects_redirects_and_oversized_responses(self):
+        for status, body in [(302, b''), (200, b'x' * (1024 * 1024 + 1))]:
+            response = requests.Response()
+            response.status_code = status
+            response._content = body
+            response._content_consumed = True
+            encoded = jwt.encode(self.claims, self.key, algorithm='RS256', headers={'kid': 'test-key'})
+            with patch.object(requests.Session, 'get', return_value=response):
+                with self.subTest(status=status), self.assertRaises(LoginRejected):
+                    self.provider.validate(encoded, 'test-nonce')
+
+    def test_provider_key_caches_are_separate(self):
+        other = Provider(dict(self.config, jwks_uri='https://other.example.test/keys'))
+        self.assertIsNot(other.keys, self.provider.keys)
+        self.assertIsNot(other.keys.jwk_set_cache, self.provider.keys.jwk_set_cache)
 
 
 class BrowserTest(unittest.TestCase):
@@ -328,17 +369,14 @@ class BrowserTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'name="viewport"', response.data)
         self.assertIn(b'css/nipap.css', response.data)
-        self.assertIn(b'id="login-heading"', response.data)
         self.assertIn(b'role="switch"', response.data)
         self.assertIn(b'class="top_menu"', response.data)
 
-    def test_dedicated_login_notice_is_escaped(self):
-        self.app.config.update(WELCOME_MESSAGE='outdated application message',
-                               LOGIN_NOTICE='<script>access notice</script>')
+    def test_existing_welcome_message_is_preserved_and_escaped(self):
+        self.app.config.update(WELCOME_MESSAGE='<script>access notice</script>')
         response = self.client.get('/auth/login', base_url=self.base)
         self.assertIn(b'&lt;script&gt;access notice&lt;/script&gt;', response.data)
         self.assertNotIn(b'<script>access notice</script>', response.data)
-        self.assertNotIn(b'outdated application message', response.data)
 
     def csrf(self):
         with self.client.session_transaction(base_url=self.base) as current:

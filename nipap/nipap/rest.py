@@ -100,14 +100,12 @@ def _mangle_prefix(res):
 
 
 def authenticate():
-    """ Send a 401 challenge for the selected scheme without credential details.
+    """ Sends a 401 response that enables basic auth
     """
-    scheme = ('Bearer' if request.authorization is not None
-              and request.authorization.type == 'bearer' else 'Basic realm="Login Required"')
     return Response(
         'Could not verify your access level for that URL.\n'
         'You have to login with proper credentials', 401,
-        {'WWW-Authenticate': scheme})
+        {'WWW-Authenticate': 'Basic realm="Login Required"'})
 
 
 def requires_auth(f):
@@ -152,13 +150,34 @@ def requires_auth(f):
             self.logger.debug("Missing authoritative source in auth options.")
             abort(401, error={"code": 401, "message": "Missing authoritative source in auth options."})
 
+        bearer_token = None
+        if not request.authorization:
+            # Check for bearer auth, Werkzeug only supports BASIC and DIGEST
+            auth_header = request.headers.get("Authorization", None)
+            if auth_header and auth_header.startswith("Bearer"):
+                bearer_token = auth_header.split(" ")[1]
+            if not bearer_token:
+                logger.info("Authentication failed, missing auth method")
+                abort(authenticate())
+
+        # init AuthFacory()
         af = AuthFactory()
-        try:
-            auth = af.get_auth_http(request.authorization, auth_source, auth_options or {})
+        auth = None
+        if bearer_token:
+            auth = af.get_auth_bearer_token(bearer_token, auth_source,
+                                            auth_options or {})
+
+            # authenticated?
             if not auth.authenticate():
-                raise AuthError('Authentication rejected')
-        except AuthError:
-            abort(authenticate())
+                abort(401, error={"code": 401,
+                                  "message": "Invalid bearer token"})
+        else:
+            auth = af.get_auth(request.authorization.username,
+                    request.authorization.password, auth_source, auth_options or {})
+
+            # authenticated?
+            if not auth.authenticate():
+                abort(401, error={"code": 401, "message": "Incorrect username or password"})
 
         # Replace auth options in API call arguments with auth object
         new_args = dict(args[0])

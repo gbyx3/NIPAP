@@ -1,7 +1,4 @@
-"""Opt-in OIDC primitives. No identity headers or backend JWT authentication.
-
-Configuration and credentials must be supplied by the administrator, not tokens.
-"""
+"""Optional browser OIDC login."""
 import hashlib
 from contextlib import contextmanager
 import hmac
@@ -9,26 +6,62 @@ import json
 import math
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 import secrets
 import sqlite3
 import time
 
 from authlib.integrations.requests_client import OAuth2Session
+import jwt
+import requests
 from flask import Blueprint, abort, current_app, g, redirect, request, session, url_for
-from nipap.jwt_auth import JwtVerifier, claim_matches, https_url
 from .web_security import init_app as init_web_security, local_return_path
 
 
 class LoginRejected(ValueError):
-    """A login could not be authenticated or authorized. Never include tokens."""
+    """A safe error message for a rejected login."""
+
+
+def https_url(value):
+    parsed = urlsplit(value)
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username
+            or parsed.password or parsed.fragment):
+        raise ValueError('OIDC requires HTTPS URLs without credentials')
+    return value
+
+
+def claim_matches(claims, name, expected):
+    return name in claims and json.dumps(claims[name], sort_keys=True, allow_nan=False) == json.dumps(
+        expected, sort_keys=True, allow_nan=False)
+
+
+class SigningKeys(jwt.PyJWKClient):
+    """Keep PyJWT's key selection and cache; bound the HTTPS fetch."""
+
+    def __init__(self, uri, ca_bundle=True):
+        super().__init__(https_url(uri), timeout=15)
+        if ca_bundle is not True and (not isinstance(ca_bundle, str) or not ca_bundle):
+            raise ValueError('OIDC TLS verification cannot be disabled')
+        self.ca_bundle = ca_bundle
+
+    def fetch_data(self):
+        with requests.Session() as client:
+            client.trust_env = False
+            with client.get(self.uri, timeout=self.timeout, verify=self.ca_bundle,
+                            allow_redirects=False, stream=True) as response:
+                if response.status_code != 200:
+                    raise jwt.PyJWKClientError('Unable to fetch signing keys')
+                chunks, size = [], 0
+                for chunk in response.iter_content(8192):
+                    size += len(chunk)
+                    if size > 1024 * 1024:
+                        raise jwt.PyJWKClientError('Signing key response too large')
+                    chunks.append(chunk)
+        return json.loads(b''.join(chunks))
 
 
 class Transactions:
-    """Bounded, atomic, one-use transactions shared by synchronous workers.
-
-    Store in a dedicated local directory owned by the web service, mode 0700.
-    The database contains short-lived PKCE verifiers; never publish or log it.
-    """
+    """One-use login state shared by workers on the same host."""
 
     def __init__(self, path, capacity=1000, ttl=300):
         self.path = Path(path)
@@ -94,12 +127,7 @@ class Transactions:
 
 
 class Provider:
-    """Strict confidential authorization-code client with explicit endpoints.
-
-    Administrators pin issuer/endpoints independently for each provider. Avoid
-    dynamic discovery and redirects at login: no token-supplied URLs are fetched.
-    Identities are keyed by exact subject; additional claims are exact matches.
-    """
+    """A configured OIDC provider and its allowed identities."""
 
     def __init__(self, config):
         self.config = dict(config)
@@ -131,11 +159,7 @@ class Provider:
             value = self.config.get(name, default)
             if type(value) is not int or not 1 <= value <= 3600:
                 raise ValueError('OIDC time limits must be integers from 1 to 3600 seconds')
-        self.verifier = JwtVerifier(
-            issuer=self.config['issuer'], audience=self.config['client_id'],
-            jwks_uri=self.config['jwks_uri'], algorithms=self.algorithms,
-            ca_bundle=self.config.get('ca_bundle', True),
-            max_age=self.config.get('max_age', 300))
+        self.keys = SigningKeys(self.config['jwks_uri'], self.config.get('ca_bundle', True))
 
     def client(self):
         client = OAuth2Session(
@@ -157,13 +181,35 @@ class Provider:
                 max_age=self.config.get('max_age', 300))
             return url
 
-    def public_keys(self):
-        return self.verifier.public_keys()
-
-    def validate(self, encoded, nonce, keys):
+    def validate(self, encoded, nonce):
         try:
-            claims = self.verifier.validate(encoded, keys=keys, nonce=nonce, oidc=True)
+            if not isinstance(encoded, str) or not encoded or len(encoded) > 65536:
+                raise LoginRejected('Invalid ID token')
+            header = jwt.get_unverified_header(encoded)
+            if header.get('alg') not in self.algorithms or 'crit' in header:
+                raise LoginRejected('Unsupported ID token algorithm or header')
+            key = self.keys.get_signing_key_from_jwt(encoded)
+            claims = jwt.decode(encoded, key=key, algorithms=self.algorithms,
+                                issuer=self.config['issuer'], audience=self.config['client_id'],
+                                leeway=30, options={'require': ['iss', 'aud', 'sub', 'exp',
+                                                               'iat', 'auth_time', 'nonce']})
             now = int(time.time())
+            if not isinstance(claims['sub'], str) or not claims['sub']:
+                raise LoginRejected('Missing subject')
+            if not isinstance(nonce, str) or not nonce or claims['nonce'] != nonce:
+                raise LoginRejected('Invalid login nonce')
+            audience = claims['aud']
+            if (isinstance(audience, list) and len(audience) > 1
+                    and claims.get('azp') != self.config['client_id']):
+                raise LoginRejected('Invalid authorized party')
+            if 'azp' in claims and claims['azp'] != self.config['client_id']:
+                raise LoginRejected('Invalid authorized party')
+            for name in ('iat', 'exp', 'auth_time'):
+                if type(claims[name]) not in (int, float) or not math.isfinite(claims[name]):
+                    raise LoginRejected('Invalid token time')
+            if (claims['auth_time'] > now + 30
+                    or now - claims['auth_time'] > self.config.get('max_age', 300) + 30):
+                raise LoginRejected('Fresh authentication required')
             identity_key = claims.get(self.identity_claim)
             if not isinstance(identity_key, str) or not identity_key:
                 raise LoginRejected('Missing immutable identity claim')
@@ -178,8 +224,7 @@ class Provider:
                         readonly=identity['readonly'], subject=claims['sub'],
                         identity_key=identity_key,
                         expires=min(claims['exp'], now + self.config.get('session_ttl', 900)))
-        except Exception:
-            # Cryptographic/library exceptions may embed claims or token data.
+        except (jwt.PyJWTError, requests.RequestException, ValueError, TypeError, KeyError, OverflowError):
             raise LoginRejected('ID token rejected') from None
 
     def exchange(self, code, transaction):
@@ -191,9 +236,9 @@ class Provider:
                     self.config['token_endpoint'], grant_type='authorization_code',
                     code=code, code_verifier=transaction['verifier'],
                     allow_redirects=False)
-                return self.validate(token.get('id_token'), transaction['nonce'],
-                                     self.public_keys())
+                return self.validate(token.get('id_token'), transaction['nonce'])
         except Exception:
+            # Provider errors can contain tokens.
             raise LoginRejected('OIDC login rejected') from None
 
 
@@ -201,11 +246,7 @@ bp = Blueprint('oidc', __name__, url_prefix='/auth/oidc')
 
 
 def init_app(app, config):
-    """Enable OIDC explicitly; call before registering other blueprints.
-
-    Config is administrator-owned, never request-supplied. SQLite storage must
-    live on local disk shared by all workers of this single web deployment.
-    """
+    """Register before the application blueprints."""
     if not config.get('providers'):
         raise ValueError('OIDC requires at least one provider')
     providers = {name: Provider(value) for name, value in config['providers'].items()}
@@ -239,8 +280,7 @@ def init_app(app, config):
                 session['readonly'] = identity['readonly']
                 session['full_name'] = identity.get('full_name', identity['username'])
 
-    # Validate/reload the external identity before shared read-only enforcement.
-    # This is mandatory even if WEB_SECURITY_ENABLED was explicitly set false.
+    # Reload the identity before checking read-only access.
     init_web_security(app)
 
 

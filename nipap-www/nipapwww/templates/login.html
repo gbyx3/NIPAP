@@ -10,19 +10,14 @@
 <div style="padding-top: 30px;">
 	<div class="options-group">
 		<div class="options-content">
-			<div class="options-group-heading" id="login-heading">Log in</div>
+			<div class="options-group-heading">Log in</div>
 			<div class="rule"></div>
-			{% if g.login_notice %}
+			{% if g.welcome_message is defined %}
 			<div class="option">
 				<dl>
 					<dt></dt>
-					<dd>{{ g.login_notice }}</dd>
+					<dd>{{ g.welcome_message }}</dd>
 				</dl>
-			</div>
-			<div class="rule"></div>
-			{% elif not oidc_providers|default({}) and g.welcome_message is defined %}
-			<div class="option">
-				<dl><dt></dt><dd>{{ g.welcome_message }}</dd></dl>
 			</div>
 			<div class="rule"></div>
 			{% endif %}
@@ -33,14 +28,14 @@
 				<div class="option">
 					<dl>
 						<dt><label for="login-username">Username</label></dt>
-						<dd><input id="login-username" type="text" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required></dd>
+						<dd><input id="login-username" type="text" name="username" autocomplete="username" autocapitalize="none" spellcheck="false"></dd>
 					</dl>
 				</div>
 				<div class="rule"></div>
 				<div class="option">
 					<dl>
 						<dt><label for="login-password">Password</label></dt>
-						<dd><input id="login-password" type="password" name="password" autocomplete="current-password" required></dd>
+						<dd><input id="login-password" type="password" name="password" autocomplete="current-password"></dd>
 					</dl>
 				</div>
 				<div class="rule"></div>
