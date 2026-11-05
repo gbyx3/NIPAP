@@ -42,25 +42,26 @@
 				<div class="option">
 					<dl>
 						<dt></dt>
-						<dd><input type="submit" value="Log in" class="button button_red"></dd>
+						<dd>
+							<input type="submit" value="Log in" class="button button_red">
+							{% if oidc_providers|default({}) %}
+							<span class="login-auth-methods">
+								<span style="margin: 0 8px;">or</span>
+								{% for provider, label in oidc_providers.items() %}
+								<button type="submit" form="login-provider-{{ provider }}" class="button">{{ label }}</button>
+								{% endfor %}
+							</span>
+							{% endif %}
+						</dd>
 					</dl>
 				</div>
 			</form>
 			{% if oidc_providers|default({}) %}
-			<div class="rule"></div>
-			<div class="option">
-				<dl>
-					<dt>Or log in with</dt>
-					<dd class="login-auth-methods">
-						{% for provider, label in oidc_providers.items() %}
-						<form class="login-auth-method" style="display: inline-block;" action="{{ url_for('oidc.begin', provider_name=provider) }}" method="post">
-							<input type="hidden" name="_csrf" value="{{ oidc_csrf_token() }}">
-							<button type="submit" class="button">{{ label }}</button>
-						</form>
-						{% endfor %}
-					</dd>
-				</dl>
-			</div>
+			{% for provider, label in oidc_providers.items() %}
+			<form id="login-provider-{{ provider }}" class="login-auth-method" action="{{ url_for('oidc.begin', provider_name=provider) }}" method="post">
+				<input type="hidden" name="_csrf" value="{{ oidc_csrf_token() }}">
+			</form>
+			{% endfor %}
 			{% endif %}
 		</div>
 	</div>
