@@ -162,6 +162,23 @@ class AuthFactory:
         return auth
 
 
+    def get_auth_http(self, authorization, authoritative_source, auth_options=None):
+        """Select Basic or Bearer auth from Werkzeug's parsed credentials."""
+        if authorization is None:
+            raise AuthError('Missing authentication method')
+        if authorization.type == 'bearer':
+            token = authorization.token
+            if (not isinstance(token, str) or not token
+                    or any(char.isspace() for char in token)):
+                raise AuthError('Invalid bearer credentials')
+            return self.get_auth_bearer_token(token, authoritative_source, auth_options)
+        if (authorization.type == 'basic' and authorization.username is not None
+                and authorization.password is not None):
+            return self.get_auth(authorization.username, authorization.password,
+                                 authoritative_source, auth_options)
+        raise AuthError('Unsupported authentication method')
+
+
     def get_auth(self, username, password, authoritative_source, auth_options=None):
         """ Returns an authentication object.
 
