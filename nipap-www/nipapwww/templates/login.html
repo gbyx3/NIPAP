@@ -3,7 +3,10 @@
 {% block head %}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/login.css') }}?v=4">
 {% endblock %}
+
+{% block body_attributes %}class="login-page"{% endblock %}
 
 {% block content %}
 
@@ -16,7 +19,7 @@
 			<div class="option">
 				<dl>
 					<dt></dt>
-					<dd>{{ g.login_notice }}</dd>
+					<dd class="login-notice">{{ g.login_notice }}</dd>
 				</dl>
 			</div>
 			<div class="rule"></div>
@@ -58,7 +61,7 @@
 					<dt>Or log in with</dt>
 					<dd class="login-auth-methods">
 						{% for provider, label in oidc_providers.items() %}
-						<form class="login-auth-method" style="display: inline-block;" action="{{ url_for('oidc.begin', provider_name=provider) }}" method="post">
+						<form class="login-auth-method" action="{{ url_for('oidc.begin', provider_name=provider) }}" method="post">
 							<input type="hidden" name="_csrf" value="{{ csrf_token() }}">
 							<button type="submit" class="button">{{ label }}</button>
 						</form>
