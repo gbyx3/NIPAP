@@ -3,6 +3,9 @@
 {% block content %}
 
 <form action="/auth/login" method="post">
+{% if csrf_token is defined %}
+<input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+{% endif %}
 <div style="padding-top: 30px;">
 	<div class="options-group">
 		<div class="options-content">
