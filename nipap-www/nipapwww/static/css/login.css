@@ -1,0 +1,16 @@
+/* Keep the original application layout; only arrange the added login methods. */
+.login-page .login-auth-methods {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.login-page .login-auth-method { margin: 0; }
+.login-page .login-auth-method button { margin: 0; }
+.login-page .login-notice { white-space: pre-line; overflow-wrap: anywhere; }
+.login-page .option label { margin: 0; font-weight: inherit; }
+@media (max-width: 600px) {
+    .login-page .content_inner { width: calc(100% - 24px); }
+    .login-page .option dt { display: block; width: auto; text-align: left; }
+    .login-page .option dd { width: 100%; margin-left: 0; }
+    .login-page .option input:not([type="submit"]) { max-width: 100%; }
+}
