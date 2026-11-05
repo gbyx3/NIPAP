@@ -13,6 +13,11 @@ from pynipap import AuthOptions
 bp = Blueprint('auth', __name__, url_prefix='/auth')
 
 
+@bp.teardown_app_request
+def clear_auth(error=None):
+    AuthOptions.clear()
+
+
 def login_required(view):
     @functools.wraps(view)
     def wrapped_view(**kwargs):
