@@ -32,7 +32,16 @@ def create_app(test_config=None):
     if test_config is not None:
         app.config.update(test_config)
 
-    if str(app.config.get('WEB_SECURITY_ENABLED', False)).lower() in ('true', 'yes', 'on', '1'):
+    if app.config.get('OIDC_CONFIG_FILE'):
+        import json
+        import stat
+        from .oidc import init_app as init_oidc
+        with open(app.config['OIDC_CONFIG_FILE']) as config_file:
+            mode = os.fstat(config_file.fileno()).st_mode
+            if not stat.S_ISREG(mode) or mode & 0o077:
+                raise NipapConfigError('OIDC configuration must be a private regular file')
+            init_oidc(app, json.load(config_file))
+    elif str(app.config.get('WEB_SECURITY_ENABLED', False)).lower() in ('true', 'yes', 'on', '1'):
         from .web_security import init_app as init_web_security
         init_web_security(app)
 
