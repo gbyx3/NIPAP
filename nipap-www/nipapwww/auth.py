@@ -38,6 +38,8 @@ def setup_auth():
 
     if current_app.config.get("WELCOME_MESSAGE"):
         g.welcome_message = current_app.config.get("WELCOME_MESSAGE")
+    if current_app.config.get("LOGIN_NOTICE"):
+        g.login_notice = current_app.config["LOGIN_NOTICE"]
 
     # set authentication options
     o = AuthOptions({
