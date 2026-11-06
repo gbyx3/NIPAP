@@ -10,15 +10,13 @@ transitively, although NIPAP does not import or pin joserfc directly.
 
 Install `nipap-www[oidc]` with the matching updated `pynipap`. Add
 `oidc_config_file = /etc/nipap/oidc.json` to `[www]`. The file must be private
-(no group/other permissions). Its state directory must be service-owned, mode
-0700, on local storage shared by all web workers. Multi-host deployments and
-interleaved asyncio requests are not supported.
+(no group/other permissions). Workers need the same Flask signing key and provider
+configuration. There is no OIDC state database or shared state directory.
 
 Example using invented identities and no real credentials:
 
 ```json
 {
-  "transaction_db": "/var/lib/nipap/oidc/state.db",
   "providers": {
     "primary": {
       "label": "Organization sign-in",
@@ -65,25 +63,37 @@ Allowed algorithms are RS256, PS256 and ES256.
 The flow uses state, nonce, PKCE S256 and `client_secret_basic`. ID tokens must
 match the configured issuer, audience and algorithms, and contain numeric `iat`,
 `exp` and a recent `auth_time`. Missing freshness or required assurance fails
-closed. Login transactions are consumed once and expire after five minutes.
+closed.
+
+Authlib keeps temporary state, nonce and the PKCE verifier in NIPAP's existing
+Flask session. The return path and a five-minute expiry are stored there too.
+The cookie is signed and HTTP-only, but not encrypted: its owner can read it.
+Starting another login replaces the pending attempt, including in another tab.
+Completed and failed callbacks clear the pending state from the returned cookie.
+A copied cookie cannot be revoked server-side; replay protection also depends on
+the IdP enforcing single-use authorization codes. This is not atomic server-side
+state consumption. Keep provider settings and return paths small enough to fit
+Flask's cookie limit.
 
 OIDC always enables the [browser protections](web-security.md): unsafe requests
 need CSRF tokens; mutation GETs and GET logout are rejected. Custom callers need
 POST and `X-XSRF-TOKEN`, or `_csrf` in HTML forms. The native form remains visible,
 and `welcome_message` keeps its existing behavior.
 
-No ID token, access token or PKCE verifier enters the Flask cookie. The existing
+No ID token, access token, refresh token or client secret enters the Flask cookie. The existing
 trusted web-to-backend account remains server-side; ID tokens are not forwarded
 as API credentials. Backend authorization is still required. Audit access uses
 the existing `audit_admins` allowlist and `<subject>@oidc:<provider>` identity.
 
-All workers need the same Flask signing key. Identity removal and read-only
+Identity removal and read-only
 changes take effect on requests after configuration reload. Sessions have an
 absolute expiry; local logout clears the cookie. Back-channel logout and central
 session revocation are not implemented.
 
-Do not log callback query strings: authorization codes can appear there. Keep
-provider secrets, transaction databases and real deployment details out of Git.
+Do not log callback query strings or enable Authlib debug logging in production.
+Keep provider secrets, session cookies and real deployment details out of Git.
+The old `transaction_db` setting is no longer used; this change does not delete
+any existing database file.
 
 ## Checks before deployment
 

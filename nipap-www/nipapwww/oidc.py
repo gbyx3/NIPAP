@@ -1,17 +1,10 @@
 """Optional browser OIDC login."""
-import hashlib
-from contextlib import contextmanager
-import hmac
 import json
 import math
-import os
-from pathlib import Path
 from urllib.parse import urlsplit
-import secrets
-import sqlite3
 import time
 
-from authlib.integrations.requests_client import OAuth2Session
+from authlib.integrations.flask_client import OAuth, FlaskOAuth2App
 import jwt
 import requests
 from flask import Blueprint, abort, current_app, g, redirect, request, session, url_for
@@ -60,70 +53,10 @@ class SigningKeys(jwt.PyJWKClient):
         return json.loads(b''.join(chunks))
 
 
-class Transactions:
-    """One-use login state shared by workers on the same host."""
-
-    def __init__(self, path, capacity=1000, ttl=300):
-        self.path = Path(path)
-        parent = self.path.parent.stat()
-        if parent.st_uid != os.getuid() or parent.st_mode & 0o077:
-            raise ValueError('OIDC state directory must be private and service-owned')
-        if self.path.is_symlink():
-            raise ValueError('OIDC state database must not be a symlink')
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            stat = os.fstat(fd)
-            if stat.st_uid != os.getuid() or stat.st_mode & 0o077:
-                raise ValueError('OIDC state database must be private and service-owned')
-        finally:
-            os.close(fd)
-        self.capacity, self.ttl = capacity, ttl
-        with self.connect() as db:
-            db.execute('CREATE TABLE IF NOT EXISTS transactions '
-                       '(state TEXT PRIMARY KEY, binding TEXT NOT NULL, '
-                       'provider TEXT NOT NULL, expires INTEGER NOT NULL, '
-                       'data TEXT NOT NULL)')
-
-    @contextmanager
-    def connect(self):
-        db = sqlite3.connect(self.path, timeout=5)
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
-
-    @staticmethod
-    def digest(value):
-        return hashlib.sha256(value.encode()).hexdigest()
-
-    def create(self, provider, binding, return_path='/'):
-        state = secrets.token_urlsafe(32)
-        data = dict(nonce=secrets.token_urlsafe(32),
-                    verifier=secrets.token_urlsafe(48),
-                    return_path=local_return_path(return_path))
-        with self.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            db.execute('DELETE FROM transactions WHERE expires <= ?', (int(time.time()),))
-            if db.execute('SELECT COUNT(*) FROM transactions').fetchone()[0] >= self.capacity:
-                raise LoginRejected('Login capacity reached')
-            db.execute('INSERT INTO transactions VALUES (?, ?, ?, ?, ?)',
-                       (self.digest(state), self.digest(binding), provider,
-                        int(time.time()) + self.ttl, json.dumps(data)))
-        return state, data
-
-    def consume(self, state, provider, binding):
-        if not state or not binding or len(state) > 256:
-            raise LoginRejected('Invalid login transaction')
-        with self.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT binding, provider, expires, data FROM transactions '
-                             'WHERE state = ?', (self.digest(state),)).fetchone()
-            if (not row or not hmac.compare_digest(row[0], self.digest(binding))
-                    or row[1] != provider or row[2] <= time.time()):
-                raise LoginRejected('Invalid login transaction')
-            db.execute('DELETE FROM transactions WHERE state = ?', (self.digest(state),))
-        return json.loads(row[3])
+class BrowserClient(FlaskOAuth2App):
+    def parse_id_token(self, token, nonce, **kwargs):
+        provider = current_app.extensions['nipap_oidc']['providers'][self.name]
+        return provider.validate(token.get('id_token'), nonce)
 
 
 class Provider:
@@ -154,32 +87,11 @@ class Provider:
                     or not identity.get('username')
                     or type(identity.get('readonly')) is not bool):
                 raise ValueError('Invalid OIDC identity mapping')
-        self.timeout = (5, 15)
         for name, default in [('max_age', 300), ('session_ttl', 900)]:
             value = self.config.get(name, default)
             if type(value) is not int or not 1 <= value <= 3600:
                 raise ValueError('OIDC time limits must be integers from 1 to 3600 seconds')
         self.keys = SigningKeys(self.config['jwks_uri'], self.config.get('ca_bundle', True))
-
-    def client(self):
-        client = OAuth2Session(
-            self.config['client_id'], self.config['client_secret'],
-            scope=' '.join(self.scopes), redirect_uri=self.config['redirect_uri'],
-            token_endpoint_auth_method='client_secret_basic',
-            code_challenge_method='S256', default_timeout=self.timeout)
-        client.trust_env = False
-        client.verify = self.config.get('ca_bundle', True)
-        if not client.verify:
-            raise ValueError('OIDC TLS verification cannot be disabled')
-        return client
-
-    def authorization_url(self, state, transaction):
-        with self.client() as client:
-            url, _ = client.create_authorization_url(
-                self.config['authorization_endpoint'], state=state,
-                nonce=transaction['nonce'], code_verifier=transaction['verifier'],
-                max_age=self.config.get('max_age', 300))
-            return url
 
     def validate(self, encoded, nonce):
         try:
@@ -227,20 +139,6 @@ class Provider:
         except (jwt.PyJWTError, requests.RequestException, ValueError, TypeError, KeyError, OverflowError):
             raise LoginRejected('ID token rejected') from None
 
-    def exchange(self, code, transaction):
-        try:
-            if not isinstance(code, str) or not code or len(code) > 8192:
-                raise LoginRejected('Invalid authorization code')
-            with self.client() as client:
-                token = client.fetch_token(
-                    self.config['token_endpoint'], grant_type='authorization_code',
-                    code=code, code_verifier=transaction['verifier'],
-                    allow_redirects=False)
-                return self.validate(token.get('id_token'), transaction['nonce'])
-        except Exception:
-            # Provider errors can contain tokens.
-            raise LoginRejected('OIDC login rejected') from None
-
 
 bp = Blueprint('oidc', __name__, url_prefix='/auth/oidc')
 
@@ -253,8 +151,20 @@ def init_app(app, config):
     if any(not name or not all(c.isalnum() or c in '-_' for c in name)
            for name in providers):
         raise ValueError('Invalid OIDC provider name')
-    store = Transactions(config['transaction_db'])
-    app.extensions['nipap_oidc'] = dict(providers=providers, store=store)
+    oauth = OAuth(app)
+    for name, provider in providers.items():
+        settings = provider.config
+        client = oauth.register(
+            name, client_cls=BrowserClient, client_id=settings['client_id'],
+            client_secret=settings['client_secret'],
+            authorize_url=settings['authorization_endpoint'],
+            access_token_url=settings['token_endpoint'],
+            client_kwargs=dict(scope=' '.join(provider.scopes),
+                               token_endpoint_auth_method='client_secret_basic',
+                               code_challenge_method='S256', default_timeout=(5, 15),
+                               trust_env=False, verify=settings.get('ca_bundle', True)))
+        client.framework.expires_in = 300
+    app.extensions['nipap_oidc'] = dict(providers=providers, oauth=oauth)
     app.register_blueprint(bp)
 
     @app.context_processor
@@ -290,13 +200,18 @@ def begin(provider_name):
     provider = extension['providers'].get(provider_name)
     if provider is None:
         abort(404)
-    binding = session.setdefault('_oidc_binding', secrets.token_urlsafe(32))
-    try:
-        state, transaction = extension['store'].create(
-            provider_name, binding, session.get('path_before_login', '/'))
-        return redirect(provider.authorization_url(state, transaction))
-    except LoginRejected:
-        abort(503, description='Login is temporarily unavailable')
+    previous = session.pop('_oidc_login', None)
+    if previous and previous['provider'] in extension['providers']:
+        old_client = extension['oauth'].create_client(previous['provider'])
+        old_client.framework.clear_state_data(session, previous['state'])
+    client = extension['oauth'].create_client(provider_name)
+    authorization = client.create_authorization_url(
+        provider.config['redirect_uri'], max_age=provider.config.get('max_age', 300))
+    client.save_authorize_data(redirect_uri=provider.config['redirect_uri'], **authorization)
+    session['_oidc_login'] = dict(provider=provider_name, state=authorization['state'],
+                                 expires=time.time() + 300,
+                                 return_path=local_return_path(session.get('path_before_login', '/')))
+    return redirect(authorization['url'])
 
 
 @bp.route('/<provider_name>/callback')
@@ -306,15 +221,30 @@ def callback(provider_name):
     if provider is None:
         abort(404)
     try:
-        # Reject duplicate parameters rather than selecting an ambiguous value.
-        if any(len(request.args.getlist(key)) != 1 for key in ('state', 'code')):
+        state, code = request.args.get('state'), request.args.get('code')
+        if (len(request.args.getlist('state')) != 1
+                or len(request.args.getlist('code')) > 1 or not state):
             raise LoginRejected('Invalid callback parameters')
-        if 'error' in request.args:
-            raise LoginRejected('Provider rejected login')
-        transaction = extension['store'].consume(
-            request.args['state'], provider_name, session.get('_oidc_binding', ''))
-        identity = provider.exchange(request.args['code'], transaction)
-    except LoginRejected:
+        if 'error' not in request.args and (not code or len(code) > 8192):
+            raise LoginRejected('Invalid authorization code')
+        pending = session.get('_oidc_login')
+        if (not pending or pending['provider'] != provider_name
+                or pending['state'] != state):
+            raise LoginRejected('Invalid login state')
+        session.pop('_oidc_login')
+        client = extension['oauth'].create_client(provider_name)
+        try:
+            # Authlib's session lookup does not enforce expiry.
+            if pending['expires'] <= time.time():
+                raise LoginRejected('Login expired')
+            token = client.authorize_access_token(allow_redirects=False)
+            if not token.get('id_token'):
+                raise LoginRejected('Missing ID token')
+            identity = token['userinfo']
+        finally:
+            client.framework.clear_state_data(session, pending['state'])
+    except Exception:
+        # Provider errors can contain tokens.
         abort(400, description='SSO login rejected. Start a new login.')
     session.clear()
     session.update(user=identity['username'], full_name=identity['full_name'],
@@ -326,4 +256,4 @@ def callback(provider_name):
     session.permanent = True
     current_app.logger.info('OIDC login accepted provider=%s user=%s readonly=%s',
                             provider_name, identity['username'], identity['readonly'])
-    return redirect(local_return_path(transaction['return_path']))
+    return redirect(local_return_path(pending['return_path']))

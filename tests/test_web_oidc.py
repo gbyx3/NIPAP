@@ -1,5 +1,4 @@
-"""Offline OIDC boundary tests using real signatures and one-use state."""
-from concurrent.futures import ThreadPoolExecutor
+"""Offline OIDC tests using real signatures and Flask session state."""
 from pathlib import Path
 import json
 import configparser
@@ -14,7 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 try:
     import jwt
     from cryptography.hazmat.primitives.asymmetric import rsa
-    from nipapwww.oidc import LoginRejected, Provider, Transactions, local_return_path
+    from nipapwww.oidc import LoginRejected, Provider, local_return_path
     from nipapwww.oidc import init_app
 except ModuleNotFoundError as error:
     if error.name not in ('authlib', 'jwt', 'cryptography', 'requests'):
@@ -27,45 +26,7 @@ from nipapwww import auth
 from nipapwww import create_app
 
 
-class TransactionsTest(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.store = Transactions(Path(self.directory.name) / 'state.db')
-
-    def test_one_use_and_browser_provider_binding(self):
-        state, expected = self.store.create('piv', 'browser')
-        for provider, binding in [('bio', 'browser'), ('piv', 'other')]:
-            with self.assertRaises(LoginRejected):
-                self.store.consume(state, provider, binding)
-        self.assertEqual(self.store.consume(state, 'piv', 'browser'), expected)
-        with self.assertRaises(LoginRejected):
-            self.store.consume(state, 'piv', 'browser')
-
-    def test_concurrent_consumption_has_exactly_one_winner(self):
-        state, _ = self.store.create('bio', 'browser')
-
-        def consume():
-            try:
-                self.store.consume(state, 'bio', 'browser')
-                return True
-            except LoginRejected:
-                return False
-
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            self.assertEqual(sum(executor.map(lambda _: consume(), range(4))), 1)
-
-    def test_expired_and_capacity(self):
-        self.store.capacity = 1
-        state, _ = self.store.create('bio', 'browser')
-        with self.assertRaises(LoginRejected):
-            self.store.create('bio', 'browser')
-        with self.store.connect() as db:
-            db.execute('UPDATE transactions SET expires = 0')
-        with self.assertRaises(LoginRejected):
-            self.store.consume(state, 'bio', 'browser')
-        self.store.create('bio', 'browser')
-
+class ReturnPathTest(unittest.TestCase):
     def test_unsafe_redirects(self):
         for value in ['https://evil.test', '//evil.test', '/\\evil', '/\nevil',
                       ' /evil', None]:
@@ -124,9 +85,7 @@ class ProviderTest(unittest.TestCase):
         result = self.validate(dict(self.claims, directory_id='directory-object'))
         self.assertEqual(result['identity_key'], 'directory-object')
         self.assertEqual(result['subject'], self.claims['sub'])
-        url = self.provider.authorization_url('state', dict(nonce='nonce', verifier='v' * 64))
-        self.assertIn('https://resource.example.test/allatclaims',
-                      parse_qs(urlsplit(url).query)['scope'][0].split())
+        self.assertIn('https://resource.example.test/allatclaims', self.provider.scopes)
 
     def test_wrong_issuer_audience_subject_nonce_assurance(self):
         for key, value in [('iss', 'https://other.test'), ('aud', 'other-client'),
@@ -162,16 +121,6 @@ class ProviderTest(unittest.TestCase):
         with self.assertRaises(LoginRejected):
             self.provider.validate('not.a.token', 'test-nonce')
 
-    def test_authorization_url_has_pkce_nonce_and_state(self):
-        transaction = dict(verifier='a' * 64, nonce='test-nonce')
-        url = self.provider.authorization_url('test-state', transaction)
-        query = parse_qs(urlsplit(url).query)
-        for key, value in [('state', 'test-state'), ('nonce', 'test-nonce'),
-                           ('code_challenge_method', 'S256'), ('response_type', 'code')]:
-            self.assertEqual(query[key], [value])
-        self.assertNotIn(transaction['verifier'], url)
-        self.assertIn('code_challenge', query)
-
     def test_insecure_configuration_rejected(self):
         for key in ['issuer', 'token_endpoint', 'authorization_endpoint',
                     'jwks_uri', 'redirect_uri']:
@@ -180,49 +129,7 @@ class ProviderTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             Provider(dict(self.config, algorithms=['HS256']))
         with self.assertRaises(ValueError):
-            Provider(dict(self.config, ca_bundle=False)).client()
-
-    def test_code_exchange_uses_pkce_fixed_endpoints_and_real_signature(self):
-        transaction = dict(nonce='test-nonce', verifier='v' * 64)
-        calls = []
-        encoded = jwt.encode(self.claims, self.key, algorithm='RS256', headers={'kid': 'test-key'})
-
-        def send(client, prepared, **kwargs):
-            calls.append(prepared.url)
-            self.assertFalse(kwargs['allow_redirects'])
-            self.assertTrue(kwargs['verify'])
-            response = requests.Response()
-            response.status_code = 200
-            response._content_consumed = True
-            if prepared.url == self.config['token_endpoint']:
-                self.assertEqual(kwargs['timeout'], (5, 15))
-                self.assertEqual(prepared.method, 'POST')
-                form = parse_qs(prepared.body)
-                self.assertEqual(form['code_verifier'], [transaction['verifier']])
-                self.assertEqual(form['redirect_uri'], [self.config['redirect_uri']])
-                self.assertEqual(form['code'], ['test-code'])
-                self.assertTrue(prepared.headers['Authorization'].startswith('Basic '))
-                data = dict(access_token='test-only-access', token_type='Bearer', id_token=encoded)
-            elif prepared.url == self.config['jwks_uri']:
-                self.assertEqual(kwargs['timeout'], 15)
-                key = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(self.key.public_key()))
-                key['kid'] = 'test-key'
-                data = dict(keys=[key])
-            else:
-                self.fail('Unexpected outbound request')
-            response._content = json.dumps(data).encode()
-            return response
-
-        with patch.object(requests.Session, 'send', autospec=True, side_effect=send):
-            identity = self.provider.exchange('test-code', transaction)
-        self.assertEqual(identity['username'], 'reader')
-        self.assertEqual(calls, [self.config['token_endpoint'], self.config['jwks_uri']])
-
-    def test_exchange_errors_do_not_expose_token_or_provider_response(self):
-        with patch.object(requests.Session, 'send', side_effect=ValueError('sensitive-value')):
-            with self.assertRaises(LoginRejected) as result:
-                self.provider.exchange('test-code', dict(nonce='n', verifier='v' * 64))
-        self.assertNotIn('sensitive-value', str(result.exception))
+            Provider(dict(self.config, ca_bundle=False))
 
     def test_signing_keys_use_pyjwt_cache_and_fixed_https_fetch(self):
         key = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(self.key.public_key()))
@@ -258,8 +165,6 @@ class ProviderTest(unittest.TestCase):
 
 class BrowserTest(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
         self.app = Flask('oidc-test', template_folder=str(
             Path(auth.__file__).parent / 'templates'))
         self.app.config.update(SECRET_KEY='test-only', TESTING=True)
@@ -270,8 +175,7 @@ class BrowserTest(unittest.TestCase):
                            redirect_uri='https://nipap.test/auth/oidc/bio/callback',
                            client_id='test-client', client_secret='test-only',
                            identities={'subject': dict(username='reader', readonly=True)})
-        init_app(self.app, dict(transaction_db=str(Path(self.directory.name) / 'state.db'),
-                                 providers={'bio': self.config}))
+        init_app(self.app, dict(providers={'bio': self.config}))
         self.app.register_blueprint(auth.bp)
         self.app.add_url_rule('/prefix', endpoint='prefix.list', view_func=lambda: '')
         self.app.add_url_rule('/version', endpoint='version.show_version', view_func=lambda: '')
@@ -388,6 +292,174 @@ class BrowserTest(unittest.TestCase):
         self.assertEqual(response.status_code, 302)
         return parse_qs(urlsplit(response.location).query)['state'][0]
 
+    def oauth_client(self):
+        return self.app.extensions['nipap_oidc']['oauth'].create_client('bio')
+
+    def state_data(self, state):
+        with self.client.session_transaction(base_url=self.base) as current:
+            return self.oauth_client().framework.get_state_data(current, state)
+
+    def test_authlib_session_holds_nonce_pkce_and_safe_return_path(self):
+        with self.client.session_transaction(base_url=self.base) as current:
+            current['path_before_login'] = '//evil.test/'
+        state = self.start()
+        data = self.state_data(state)
+        query = parse_qs(urlsplit(data['url']).query)
+        self.assertEqual(query['state'], [state])
+        self.assertEqual(query['nonce'], [data['nonce']])
+        self.assertEqual(query['code_challenge_method'], ['S256'])
+        self.assertEqual(query['response_type'], ['code'])
+        self.assertEqual(query['max_age'], ['300'])
+        self.assertNotIn(data['code_verifier'], data['url'])
+        with self.client.session_transaction(base_url=self.base) as current:
+            self.assertEqual(current['_oidc_login']['return_path'], '/')
+            self.assertLessEqual(current['_oidc_login']['expires'] - time.time(), 300)
+            self.assertNotIn('client_secret', json.dumps(dict(current)))
+
+    def test_new_attempt_replaces_previous_state_without_growing_cookie(self):
+        previous = self.start()
+        for _ in range(8):
+            state = self.start()
+            self.assertIsNone(self.state_data(previous))
+            self.assertIsNotNone(self.state_data(state))
+            cookie = self.client.get_cookie('session', domain='nipap.test')
+            self.assertLess(len(cookie.value), 3800)
+            previous = state
+
+    def test_missing_browser_cookie_or_wrong_provider_rejects_before_exchange(self):
+        state = self.start()
+        extension = self.app.extensions['nipap_oidc']
+        extension['providers']['other'] = Provider(self.config)
+        with patch.object(self.oauth_client(), 'fetch_access_token') as exchange:
+            response = self.app.test_client().get('/auth/oidc/bio/callback', base_url=self.base,
+                query_string={'state': state, 'code': 'test-code'})
+            self.assertEqual(response.status_code, 400)
+            response = self.client.get('/auth/oidc/other/callback', base_url=self.base,
+                query_string={'state': state, 'code': 'test-code'})
+            self.assertEqual(response.status_code, 400)
+            exchange.assert_not_called()
+
+    def test_expired_state_is_cleared_without_exchange(self):
+        state = self.start()
+        with self.client.session_transaction(base_url=self.base) as current:
+            current['_oidc_login'] = dict(current['_oidc_login'], expires=0)
+        with patch.object(self.oauth_client(), 'fetch_access_token') as exchange:
+            response = self.client.get('/auth/oidc/bio/callback', base_url=self.base,
+                query_string={'state': state, 'code': 'test-code'})
+            self.assertEqual(response.status_code, 400)
+            exchange.assert_not_called()
+        self.assertIsNone(self.state_data(state))
+
+    def test_missing_id_token_cannot_supply_an_unverified_identity(self):
+        state = self.start()
+        token = dict(access_token='synthetic-token', userinfo={'username': 'administrator'})
+        with patch.object(self.oauth_client(), 'fetch_access_token', return_value=token):
+            response = self.client.get('/auth/oidc/bio/callback', base_url=self.base,
+                query_string={'state': state, 'code': 'test-code'})
+        self.assertEqual(response.status_code, 400)
+        self.assertIsNone(self.state_data(state))
+        with self.client.session_transaction(base_url=self.base) as current:
+            self.assertNotIn('user', current)
+
+    def test_exchange_failure_is_sanitized_and_discards_pending_state(self):
+        state = self.start()
+        with patch.object(self.oauth_client(), 'fetch_access_token', side_effect=ValueError('sensitive-value')):
+            response = self.client.get('/auth/oidc/bio/callback', base_url=self.base,
+                query_string={'state': state, 'code': 'test-code'})
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn(b'sensitive-value', response.data)
+        self.assertIsNone(self.state_data(state))
+
+    def test_provider_denial_clears_state_without_exchange(self):
+        state = self.start()
+        with patch.object(self.oauth_client(), 'fetch_access_token') as exchange:
+            response = self.client.get('/auth/oidc/bio/callback', base_url=self.base,
+                query_string={'state': state, 'error': 'access_denied',
+                              'error_description': 'sensitive-description'})
+            self.assertEqual(response.status_code, 400)
+            self.assertNotIn(b'sensitive-description', response.data)
+            exchange.assert_not_called()
+        self.assertIsNone(self.state_data(state))
+
+    def test_copied_cookie_relies_on_idp_rejecting_a_reused_code(self):
+        state = self.start()
+        cookie = self.client.get_cookie('session', domain='nipap.test').value
+        identity = dict(username='reader', full_name='Reader', readonly=True,
+                        subject='subject', identity_key='subject', expires=time.time() + 300)
+        provider = self.app.extensions['nipap_oidc']['providers']['bio']
+        token = dict(id_token='synthetic-id-token', access_token='synthetic-access-token')
+        with patch.object(self.oauth_client(), 'fetch_access_token',
+                          side_effect=[token, ValueError('authorization code already used')]) as exchange, \
+             patch.object(provider, 'validate', return_value=identity):
+            response = self.client.get('/auth/oidc/bio/callback', base_url=self.base,
+                query_string={'state': state, 'code': 'test-code'})
+            self.assertEqual(response.status_code, 302)
+            self.client.set_cookie('session', cookie, domain='nipap.test')
+            response = self.client.get('/auth/oidc/bio/callback', base_url=self.base,
+                query_string={'state': state, 'code': 'test-code'})
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(exchange.call_count, 2)
+
+    def test_cookie_signature_tampering_rejects_state(self):
+        state = self.start()
+        cookie = self.client.get_cookie('session', domain='nipap.test').value
+        self.client.set_cookie('session', 'X' + cookie[1:], domain='nipap.test')
+        with patch.object(self.oauth_client(), 'fetch_access_token') as exchange:
+            response = self.client.get('/auth/oidc/bio/callback', base_url=self.base,
+                query_string={'state': state, 'code': 'test-code'})
+            self.assertEqual(response.status_code, 400)
+            exchange.assert_not_called()
+
+    def test_full_callback_exchanges_session_pkce_and_verifies_signature(self):
+        with self.client.session_transaction(base_url=self.base) as current:
+            current['path_before_login'] = '/prefix?example=1'
+        state = self.start()
+        data = self.state_data(state)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        now = int(time.time())
+        encoded = jwt.encode(dict(iss=self.config['issuer'], aud=self.config['client_id'],
+                                  sub='subject', nonce=data['nonce'], iat=now,
+                                  exp=now + 600, auth_time=now), key,
+                             algorithm='RS256', headers={'kid': 'test-key'})
+        calls = []
+        def send(client, prepared, **kwargs):
+            calls.append(prepared.url)
+            self.assertFalse(client.trust_env)
+            self.assertTrue(kwargs['verify'])
+            self.assertFalse(kwargs['allow_redirects'])
+            response = requests.Response()
+            response.status_code = 200
+            response._content_consumed = True
+            if prepared.url == self.config['token_endpoint']:
+                self.assertEqual(kwargs['timeout'], (5, 15))
+                form = parse_qs(prepared.body)
+                self.assertEqual(form['code_verifier'], [data['code_verifier']])
+                self.assertEqual(form['redirect_uri'], [self.config['redirect_uri']])
+                self.assertEqual(form['code'], ['test-code'])
+                self.assertTrue(prepared.headers['Authorization'].startswith('Basic '))
+                body = dict(access_token='synthetic-access-token', refresh_token='synthetic-refresh-token',
+                            token_type='Bearer', id_token=encoded)
+            elif prepared.url == self.config['jwks_uri']:
+                self.assertEqual(kwargs['timeout'], 15)
+                public = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key()))
+                body = {'keys': [dict(public, kid='test-key')]}
+            else:
+                self.fail('Unexpected outbound request')
+            response._content = json.dumps(body).encode()
+            return response
+        with patch.object(requests.Session, 'send', autospec=True, side_effect=send):
+            response = self.client.get('/auth/oidc/bio/callback', base_url=self.base,
+                query_string={'state': state, 'code': 'test-code'})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.location, '/prefix?example=1')
+        self.assertEqual(calls, [self.config['token_endpoint'], self.config['jwks_uri']])
+        with self.client.session_transaction(base_url=self.base) as current:
+            self.assertEqual(current['user'], 'reader')
+            saved = json.dumps(dict(current))
+            for secret in [encoded, 'synthetic-access-token', 'synthetic-refresh-token',
+                           data['nonce'], data['code_verifier']]:
+                self.assertNotIn(secret, saved)
+
     def test_csrf_and_mutating_get_rejected(self):
         self.assertEqual(self.client.post('/auth/oidc/bio/login',
                                          base_url=self.base).status_code, 403)
@@ -399,19 +471,23 @@ class BrowserTest(unittest.TestCase):
         identity = dict(username='reader', full_name='Reader', readonly=True,
                         subject='subject', identity_key='subject', expires=time.time() + 300)
         provider = self.app.extensions['nipap_oidc']['providers']['bio']
-        with patch.object(provider, 'exchange', return_value=identity) as exchange:
+        token = dict(id_token='synthetic-id-token', access_token='synthetic-access-token')
+        with patch.object(self.oauth_client(), 'fetch_access_token', return_value=token) as exchange, \
+             patch.object(provider, 'validate', return_value=identity) as validate:
             response = self.client.get('/auth/oidc/bio/callback', base_url=self.base,
                                        query_string={'state': state, 'code': 'one-use-code'})
             self.assertEqual(response.status_code, 302)
             exchange.assert_called_once()
+            validate.assert_called_once()
             self.assertEqual(self.client.get('/auth/oidc/bio/callback', base_url=self.base,
                 query_string={'state': state, 'code': 'one-use-code'}).status_code, 400)
             exchange.assert_called_once()
         current = self.client.get('/identity', base_url=self.base).get_json()
         self.assertTrue(current['readonly'])
         self.assertEqual(current['authenticated_identity'], 'subject@oidc:bio')
-        for forbidden in ['id_token', 'access_token', 'refresh_token', 'verifier', '_oidc_binding']:
+        for forbidden in ['id_token', 'access_token', 'refresh_token', '_oidc_login']:
             self.assertNotIn(forbidden, current)
+        self.assertFalse(any(key.startswith('_state_') for key in current))
         self.assertEqual(self.client.post('/write', base_url=self.base,
             headers={'X-XSRF-TOKEN': self.csrf()}).status_code, 403)
 
@@ -419,8 +495,7 @@ class BrowserTest(unittest.TestCase):
         self.assertEqual(self.client.get('/auth/oidc/unknown/callback',
                                          base_url=self.base).status_code, 404)
         state = self.start()
-        provider = self.app.extensions['nipap_oidc']['providers']['bio']
-        with patch.object(provider, 'exchange') as exchange:
+        with patch.object(self.oauth_client(), 'fetch_access_token') as exchange:
             response = self.client.get('/auth/oidc/bio/callback', base_url=self.base,
                 query_string=[('state', state), ('state', state), ('code', 'test')])
             self.assertEqual(response.status_code, 400)
@@ -480,8 +555,7 @@ class AppFactoryTest(unittest.TestCase):
 
     def test_private_file_enables_full_application_and_rejects_public_file(self):
         path = Path(self.directory.name) / 'oidc.json'
-        config = dict(transaction_db=str(Path(self.directory.name) / 'state.db'),
-                      providers={'primary': dict(
+        config = dict(providers={'primary': dict(
                           issuer='https://idp.example.test/',
                           authorization_endpoint='https://idp.example.test/authorize',
                           token_endpoint='https://idp.example.test/token',
@@ -496,6 +570,7 @@ class AppFactoryTest(unittest.TestCase):
         response = app.test_client().get('/auth/login', base_url='https://ipam.example.test')
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'/auth/oidc/primary/login', response.data)
+        self.assertEqual(list(Path(self.directory.name).iterdir()), [path])
         os.chmod(path, 0o644)
         from nipap.nipapconfig import NipapConfigError
         with self.assertRaises(NipapConfigError):
