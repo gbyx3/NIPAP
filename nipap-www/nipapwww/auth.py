@@ -8,9 +8,15 @@ from flask import (
 from nipap.authlib import AuthError, AuthFactory
 
 from pynipap import AuthOptions
+from .web_security import local_return_path
 
 
 bp = Blueprint('auth', __name__, url_prefix='/auth')
+
+
+@bp.teardown_app_request
+def clear_auth(error=None):
+    AuthOptions.clear()
 
 
 def login_required(view):
@@ -75,15 +81,10 @@ def login():
     session.permanent = True
 
     # Send user back to the page he originally wanted to get to
-    if path_before_login:
-        return redirect(path_before_login)
-
-    else:
-        # if previous target is unknown just send the user to a welcome page
-        return redirect(url_for('prefix.list'))
+    return redirect(local_return_path(path_before_login, url_for('prefix.list')))
 
 
-@bp.route('/logout', methods=('GET',))
+@bp.route('/logout', methods=('GET', 'POST'))
 def logout():
     """ Log out the user and display a confirmation message.
     """

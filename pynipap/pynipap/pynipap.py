@@ -210,16 +210,18 @@ import xmlrpc.client as xmlrpclib
 import urllib.parse
 
 from .tracing import create_span
-class AuthOptions:
-    """ A global-ish authentication option container.
+from threading import local
 
-        Note that this essentially is a global variable. If you handle multiple
-        queries from different users, you need to make sure that the
-        AuthOptions-instances are set to the current user's.
+
+class AuthOptions:
+    """Authentication options shared only within the current thread.
+
+        Applications must set these at the start of every request. Threads must
+        never inherit another thread's identity or read-only permissions. This
+        synchronous client does not support interleaved asyncio tasks.
     """
 
-    __shared_state = {}
-    options = None
+    __state = local()
 
     def __init__(self, options = None):
         """ Create a shared option container.
@@ -228,13 +230,28 @@ class AuthOptions:
             options.
         """
 
-        self.__dict__ = self.__shared_state
-
-        if len(self.__shared_state) == 0 and options is None:
-            raise NipapMissingInputError("authentication options not set")
-
         if options is not None:
             self.options = options
+        else:
+            # Fail closed when this thread has not established an identity.
+            self.options
+
+    @property
+    def options(self):
+        try:
+            return self.__state.options
+        except AttributeError:
+            raise NipapMissingInputError("authentication options not set") from None
+
+    @options.setter
+    def options(self, options):
+        self.__state.options = dict(options)
+
+    @classmethod
+    def clear(cls):
+        """Discard the current thread's identity when a request finishes."""
+        if hasattr(cls.__state, 'options'):
+            del cls.__state.options
 
 
 class XMLRPCConnection:

@@ -73,7 +73,7 @@ nipapAppControllers.controller('VRFListController', function ($scope, $http) {
 		evt.preventDefault();
 		var dialog = showDialogYesNo('Really remove VRF?', 'Are you sure you want to remove the VRF "' + vrf.rt + '"?',
 		function () {
-			$http.get('/xhr/remove_vrf/' + vrf.id)
+			$http.post('/xhr/remove_vrf/' + vrf.id)
 				.then(function (response) {
 					if (response.data.hasOwnProperty('error')) {
 						showDialogNotice('Error', response.data.message);
@@ -131,7 +131,7 @@ nipapAppControllers.controller('PoolListController', function ($scope, $http) {
 		evt.preventDefault();
 		var dialog = showDialogYesNo('Really remove pool?', 'Are you sure you want to remove the pool "' + pool.name + '"?',
 		function () {
-			$http.get('/xhr/remove_pool/' + pool.id)
+			$http.post('/xhr/remove_pool/' + pool.id)
 				.then(function (response) {
 					if (response.data.hasOwnProperty('error')) {
 						showDialogNotice('Error', response.data.message);
